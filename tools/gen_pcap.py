@@ -13,18 +13,29 @@ link type) containing interleaved conversations:
   * ICMP and ICMPv6 echo request/reply
   * ARP request/reply (non-IP traffic)
   * about 8% of conversations on an 802.1Q VLAN, 2% double-tagged (802.1ad)
+  * with --gtp-fraction F > 0, about that share of the packets is mobile
+    user-plane traffic: GTP-U (UDP port 2152) between LTE eNodeBs / 5G
+    gNodeBs and a core SGW-U / UPF, carrying the same kinds of TCP, DNS,
+    UDP and ping conversations for phones (UEs), plus GTP-U echo
+    request/response and the occasional End Marker
 
 All IPv4 header, TCP, UDP, ICMP and ICMPv6 checksums are computed, so tools
 such as Wireshark show the packets as valid. Addresses come from the
 documentation ranges (10.0.0.0/16 clients, 198.51.100.0/24 and
-203.0.113.0/24 servers, 2001:db8::/32 for IPv6).
+203.0.113.0/24 servers, 2001:db8::/32 for IPv6); GTP-U transport uses
+172.16.0.0/16 and phones get addresses from 100.64.0.0/10, the shared
+address space carriers use for them.
 
-The same arguments always produce a byte-identical file. Only the Python
-standard library is used.
+The same arguments always produce a byte-identical file. GTP-U traffic
+draws from its own random generator, so --gtp-fraction 0 (the default)
+writes exactly what the generator wrote before GTP-U support existed. Only
+the Python standard library is used.
 
-Example:
+Examples:
     python3 tools/gen_pcap.py --seed 17 --packets 400 --flows 30 \\
         --out samples/sample.pcap
+    python3 tools/gen_pcap.py --seed 2 --packets 300 --flows 6 \\
+        --gtp-fraction 0.9 --out samples/gtpu_sample.pcap
 """
 
 import argparse
@@ -124,6 +135,7 @@ class Endpoints:
         self.cmac = cmac
         self.smac = smac
         self.tags = tags            # list of (tpid, vlan id), outermost first
+        self.mss = None             # TCP MSS: None means the Ethernet default
 
     def frame(self, from_client, ethertype, l3):
         dst, src = (self.smac, self.cmac) if from_client else \
@@ -167,7 +179,7 @@ def tcp_conversation(rng, blob, ep, sport, dport, budget):
     """Yield (gap_us, frame) for one TCP connection of about `budget`
     packets."""
     v = ep.version
-    mss = 1460 if v == 4 else 1440
+    mss = ep.mss or (1460 if v == 4 else 1440)
     rtt = rng.randint(2000, 80000)                  # microseconds
     cseq, sseq = rng.getrandbits(32), rng.getrandbits(32)
     ident = {True: rng.getrandbits(16), False: rng.getrandbits(16)}
@@ -313,6 +325,212 @@ def arp_conversation(rng, ep, client_ip, server_ip):
     yield rng.randint(50, 500), ep.frame(False, ETH_ARP, rep)
 
 
+# --- GTP-U (3GPP TS 29.281) -------------------------------------------------
+
+GTPU_PORT = 2152
+GTP_ECHO_REQUEST, GTP_ECHO_RESPONSE = 1, 2
+GTP_END_MARKER, GTP_GPDU = 254, 255
+EXT_PDU_SESSION_CONTAINER = 0x85    # 5G: carries the QoS flow ID (QFI)
+IE_RECOVERY = 14                    # Echo Response: restart counter
+
+
+def gtpu_message(msg_type, teid, payload=b"", seq=None, ext=None):
+    """A GTPv1-U message: 8-byte header, then (if S or E is set) sequence
+    number, N-PDU number and next extension type, then the extension
+    header, then the payload.
+
+    `ext` is (type, content) for one extension header. Its length byte
+    counts 4-byte units covering the length byte, the content and the
+    next-type byte, so len(content) + 2 must be a multiple of 4.
+    """
+    flags = 0x30                    # version 1, PT 1 (GTP, not GTP')
+    opt = b""
+    if seq is not None or ext is not None:
+        next_type, ext_bytes = 0, b""
+        if seq is not None:
+            flags |= 0x02           # S
+        if ext is not None:
+            flags |= 0x04           # E
+            next_type, content = ext
+            size = len(content) + 2
+            assert size % 4 == 0
+            ext_bytes = bytes([size // 4]) + content + b"\x00"
+        opt = struct.pack("!HBB", seq or 0, 0, next_type) + ext_bytes
+    body = opt + payload
+    return struct.pack("!BBHI", flags, msg_type, len(body), teid) + body
+
+
+class GtpPath:
+    """The transport between one base station and the core's user-plane
+    node. Uplink (base station -> core) is the Endpoints' client
+    direction."""
+
+    def __init__(self, rng, ep, five_g):
+        self.ep = ep
+        self.five_g = five_g
+        self.ident = {True: rng.getrandbits(16), False: rng.getrandbits(16)}
+
+    def send(self, uplink, message, sport=GTPU_PORT, dport=GTPU_PORT):
+        src, dst = self.ep.addrs(uplink)
+        dgram = udp_datagram(self.ep.version, src, dst, sport, dport, message)
+        self.ident[uplink] = (self.ident[uplink] + 1) & 0xFFFF
+        return self.ep.ip(uplink, 17, dgram, self.ident[uplink])
+
+
+class TunnelEndpoints:
+    """Stands in for Endpoints in the conversation generators, so the same
+    TCP, DNS, UDP and ping code produces a phone's traffic, but every packet
+    travels inside GTP-U. The phone (UE) is the client. A TEID is chosen by
+    the node that receives it: uplink packets carry the core's TEID,
+    downlink packets the base station's."""
+
+    def __init__(self, path, version, ue, server, ul_teid, dl_teid, qfi,
+                 use_seq):
+        self.path = path
+        self.version = version
+        self.client = ue
+        self.server = server
+        # 40-byte TCP/IP headers plus up to 16 of GTP-U, 8 of UDP and 20 or
+        # 40 of outer IP must fit a 1500-byte MTU, so operators clamp the
+        # MSS well below 1460.
+        self.mss = 1360 if version == 4 else 1340
+        self.teid = {True: ul_teid, False: dl_teid}
+        self.qfi = qfi              # 5G only: the PDU Session Container
+        self.seq = {True: 0, False: 0} if use_seq else None
+
+    def addrs(self, from_client):
+        return (self.client, self.server) if from_client else \
+               (self.server, self.client)
+
+    def ip(self, from_client, proto, l4, ident=0):
+        src, dst = self.addrs(from_client)
+        if self.version == 4:
+            inner = ipv4_packet(src, dst, proto, l4, ident)
+        else:
+            inner = ipv6_packet(src, dst, proto, l4)
+        seq = None
+        if self.seq is not None:
+            seq = self.seq[from_client]
+            self.seq[from_client] = (seq + 1) & 0xFFFF
+        ext = None
+        if self.qfi is not None:
+            # TS 38.415: PDU type (0 downlink, 1 uplink) in the high nibble,
+            # then the QoS flow identifier.
+            ext = (EXT_PDU_SESSION_CONTAINER,
+                   bytes([(1 if from_client else 0) << 4, self.qfi]))
+        msg = gtpu_message(GTP_GPDU, self.teid[from_client], inner, seq, ext)
+        return self.path.send(from_client, msg)
+
+    def end_marker(self):
+        return self.path.send(False, gtpu_message(GTP_END_MARKER,
+                                                  self.teid[False]))
+
+
+def with_end_marker(rng, conversation, tep):
+    """A session that ends with the core's End Marker on its downlink
+    tunnel, as when a handover moves the phone to another base station."""
+    yield from conversation
+    yield rng.randint(1000, 20000), tep.end_marker()
+
+
+def gtp_echo_conversation(rng, path, count):
+    """Path management: the base station's Echo Requests go from a locally
+    chosen port to 2152, and the core's Echo Responses come back to that
+    port, so they have 2152 only as their source port."""
+    sport = rng.randint(32768, 60999)
+    for n in range(count):
+        seq = rng.getrandbits(16)
+        req = gtpu_message(GTP_ECHO_REQUEST, 0, seq=seq)
+        yield (0 if n == 0 else rng.randint(400000, 600000)), \
+            path.send(True, req, sport, GTPU_PORT)
+        rsp = gtpu_message(GTP_ECHO_RESPONSE, 0,
+                           struct.pack("!BB", IE_RECOVERY, 0), seq=seq)
+        yield rng.randint(200, 2000), path.send(False, rsp, GTPU_PORT, sport)
+
+
+def gtp_conversations(rng, blob, packets, window_us):
+    """Plan about `packets` packets of GTP-U traffic. Yields (start_us,
+    generator) pairs.
+
+    Two LTE eNodeBs (S1-U) and two 5G gNodeBs (N3, one over IPv6 on VLAN
+    300) talk to one SGW-U / UPF. Each phone session gets its own pair of
+    TEIDs. 5G sessions carry a PDU Session Container extension header;
+    some LTE sessions use sequence numbers.
+    """
+    core4 = bytes([172, 16, 0, 1])
+    core6 = bytes.fromhex("20010db8000500000000000000000001")
+    gnb6 = bytes.fromhex("20010db8000500000000000000000031")
+    core_mac = mac_for(4, 1)
+    paths = [
+        GtpPath(rng, Endpoints(4, bytes([172, 16, 1, 11]), core4,
+                               mac_for(3, 11), core_mac, []), False),
+        GtpPath(rng, Endpoints(4, bytes([172, 16, 1, 12]), core4,
+                               mac_for(3, 12), core_mac, []), False),
+        GtpPath(rng, Endpoints(4, bytes([172, 16, 1, 21]), core4,
+                               mac_for(3, 21), core_mac, []), True),
+        GtpPath(rng, Endpoints(6, gnb6, core6, mac_for(3, 31), core_mac,
+                               [(TPID_8021Q, 300)]), True),
+    ]
+    echo_pairs = [rng.randint(2, 3) for _ in paths]
+    for path, count in zip(paths, echo_pairs):
+        yield rng.randrange(window_us), gtp_echo_conversation(rng, path,
+                                                              count)
+
+    # Budgets as in plan(): DNS and ping sessions are short and fixed, and
+    # the packets left over are shared among the TCP and bulk sessions in
+    # proportion to Pareto(1.5) weights.
+    remaining = max(0, packets - 2 * sum(echo_pairs))
+    sessions = max(3, remaining // 25)
+    kinds = rng.choices(["tcp", "dns", "ping", "bulk"],
+                        weights=[55, 20, 15, 10], k=sessions)
+    budgets = [0] * sessions
+    for i, kind in enumerate(kinds):
+        if kind == "dns":
+            budgets[i] = rng.randint(1, 4)          # query/response pairs
+        elif kind == "ping":
+            budgets[i] = rng.randint(1, 5)          # echo request/reply pairs
+    fixed = sum(2 * b for b in budgets)
+    elastic = [i for i, kind in enumerate(kinds) if kind in ("tcp", "bulk")]
+    weights = [rng.paretovariate(1.5) for _ in elastic]
+    share = max(8 * len(elastic), remaining - fixed)
+    total = sum(weights) or 1.0
+    for i, w in zip(elastic, weights):
+        budgets[i] = max(8, int(w / total * share))
+
+    for i, kind in enumerate(kinds):
+        path = paths[rng.randrange(len(paths))]
+        n = i + 1
+        version = 6 if rng.random() < 0.35 else 4
+        si = rng.randrange(508)
+        if version == 4:
+            ue = bytes([100, 64 + (n >> 16) % 64, (n >> 8) & 0xFF, n & 0xFF])
+            server = bytes([198, 51, 100, si + 1]) if si < 254 else \
+                bytes([203, 0, 113, si - 253])
+        else:
+            ue = bytes.fromhex("20010db80100") + struct.pack("!H", n) + \
+                bytes(7) + b"\x01"
+            server = bytes.fromhex("20010db800ff00000000000000000000")[:12] \
+                + struct.pack("!I", si + 1)
+        qfi = rng.choice([1, 5, 9]) if path.five_g else None
+        use_seq = not path.five_g and rng.random() < 0.3
+        tep = TunnelEndpoints(path, version, ue, server,
+                              rng.getrandbits(32) or 1,
+                              rng.getrandbits(32) or 1, qfi, use_seq)
+        sport = rng.randint(32768, 60999)
+        if kind == "tcp":
+            gen = tcp_conversation(rng, blob, tep, sport, 443, budgets[i])
+        elif kind == "dns":
+            gen = dns_conversation(rng, blob, tep, sport, budgets[i])
+        elif kind == "ping":
+            gen = ping_conversation(rng, tep, budgets[i])
+        else:
+            gen = udp_bulk_conversation(rng, blob, tep, sport, 443,
+                                        budgets[i], False)
+        if rng.random() < 0.2:
+            gen = with_end_marker(rng, gen, tep)
+        yield rng.randrange(window_us), gen
+
+
 # --- scheduling ------------------------------------------------------------
 
 def mac_for(kind, index):
@@ -402,7 +620,8 @@ def generate(args):
     blob = Blob(rng)
     window_us = max(1_000_000, args.packets * 1_000_000 // PACKETS_PER_SEC)
     n_clients = max(4, min(60000, args.flows // 4))
-    kinds, budgets = plan(rng, args.packets, args.flows)
+    gtp_packets = round(args.packets * args.gtp_fraction)
+    kinds, budgets = plan(rng, args.packets - gtp_packets, args.flows)
 
     # Heap of (time_us, sequence, generator, frame): always emit the
     # earliest pending packet, so timestamps come out in order.
@@ -419,6 +638,19 @@ def generate(args):
 
     for kind, budget in zip(kinds, budgets):
         start(kind, budget, rng.randrange(window_us))
+
+    # GTP-U traffic uses its own generator, seeded from the same seed, and
+    # only when asked for: with --gtp-fraction 0 not one random number is
+    # drawn differently, so the default output is unchanged.
+    if gtp_packets > 0:
+        grng = random.Random(f"gtp-{args.seed}")
+        gblob = Blob(grng)
+        for at_us, gen in gtp_conversations(grng, gblob, gtp_packets,
+                                            window_us):
+            first = next(gen, None)
+            if first is not None:
+                heapq.heappush(heap, (at_us + first[0], seq, gen, first[1]))
+                seq += 1
 
     written = 0
     started = args.flows
@@ -461,10 +693,15 @@ def main():
                    help="number of conversations to plan (default 50); a "
                         "few more are added only if they all finish before "
                         "--packets is reached")
+    p.add_argument("--gtp-fraction", type=float, default=0.0,
+                   help="share of the packets, 0 to 1, that is GTP-U "
+                        "user-plane traffic (default 0)")
     p.add_argument("--out", required=True, help="output .pcap path")
     args = p.parse_args()
     if args.packets < 1 or args.flows < 1:
         p.error("--packets and --flows must be positive")
+    if not 0.0 <= args.gtp_fraction <= 1.0:
+        p.error("--gtp-fraction must be between 0 and 1")
     written, convs = generate(args)
     print(f"wrote {written} packets from {convs} conversations to {args.out}")
 

@@ -6,10 +6,14 @@
  *
  * Built with -fsanitize=address,undefined. Each iteration takes a valid seed
  * frame, applies a few random mutations (bit flips, random bytes, "length
- * field" values such as 0, 5, 0xFFFF, truncation, extension) and decodes it
- * from a heap buffer of exactly the mutated length, so AddressSanitizer
- * catches a read even one byte past the end. The result goes through the
- * same accounting as the real tool (fragment cache, counters, flow table).
+ * field" values such as 0, 5, 0xFFFF, truncation, extension; for GTP-U
+ * seeds, also targeted changes to the GTP-U flags, length and extension
+ * header length) and decodes it from a heap buffer of exactly the mutated
+ * length, so AddressSanitizer catches a read even one byte past the end.
+ * It then decodes the same bytes again with random bytes after them, and
+ * the two results must be identical: the decoder may not look past caplen.
+ * The result goes through the same accounting as the real tool (fragment
+ * cache, counters, flow and tunnel tables).
  *
  * Every fourth iteration also builds a small pcap file from mutated frames,
  * corrupts its record headers (caplen in particular) and file bytes, and
@@ -40,8 +44,9 @@
 #include "report.h"
 
 #define MAX_FRAME 2048
-#define MAX_SEEDS 16
+#define MAX_SEEDS 20
 #define MAX_RECORDS 4
+#define PAST_CAP_BYTES 64 /* random bytes placed after caplen */
 
 static uint64_t rng_state;
 
@@ -157,6 +162,50 @@ static void mutate(uint8_t *buf, size_t *len, size_t max)
     }
 }
 
+/* Change one of the GTP-U fields that steer the parse. `at` is the offset
+ * of the GTP-U header in a seed frame. Each write is bounds-checked, since
+ * the frame may be shorter than the seed was. */
+static void mutate_gtpu(uint8_t *buf, size_t len, size_t at)
+{
+    static const uint8_t ext_len[] = {0, 1, 2, 3, 0xFF};
+
+    switch (rng_below(5)) {
+    case 0: /* flags: version, PT, spare, E, S or PN */
+        if (at < len) {
+            unsigned bit = (unsigned)rng_below(8);
+
+            buf[at] ^= (uint8_t)(1u << bit);
+        }
+        break;
+    case 1: /* length: a boundary value */
+        if (at + 4 <= len) {
+            uint16_t v = interesting16[rng_below(COUNT_OF(interesting16))];
+
+            buf[at + 2] = (uint8_t)(v >> 8);
+            buf[at + 3] = (uint8_t)v;
+        }
+        break;
+    case 2: /* length: off by -4 .. +4 */
+        if (at + 4 <= len) {
+            unsigned old = ((unsigned)buf[at + 2] << 8) | buf[at + 3];
+            size_t delta = rng_below(9);
+            uint16_t v = (uint16_t)(old + delta - 4); /* wraps mod 2^16 */
+
+            buf[at + 2] = (uint8_t)(v >> 8);
+            buf[at + 3] = (uint8_t)v;
+        }
+        break;
+    case 3: /* next extension header type: start or extend a chain */
+        if (at + 12 <= len)
+            buf[at + 11] = (rng() & 1) ? 0x85 : (uint8_t)rng();
+        break;
+    default: /* the first extension header's length, including 0 */
+        if (at + 13 <= len)
+            buf[at + 12] = ext_len[rng_below(COUNT_OF(ext_len))];
+        break;
+    }
+}
+
 static void fail(const char *what, unsigned long long iter)
 {
     fprintf(stderr, "fuzz_decode: invariant violated at iteration %llu: %s\n",
@@ -190,6 +239,93 @@ static void check_invariants(const struct packet_info *pi,
      * is too short for its headers, the frame itself is malformed. */
     if (complete && decode_status_is_truncation(st))
         fail("complete frame classified as truncated", iter);
+
+    /* GTP-U only ever sits on a cleanly decoded, unfragmented UDP datagram
+     * on port 2152, and nothing inside it is set without it. */
+    if ((unsigned)pi->gtp_status >= DEC_STATUS_COUNT)
+        fail("GTP-U status out of range", iter);
+    if (pi->is_gtpu && (st != DEC_OK || pi->frag != FRAG_NONE ||
+                        !decode_is_gtpu_port(pi)))
+        fail("GTP-U decoded outside a clean UDP port 2152 datagram", iter);
+    if (!pi->is_gtpu && (pi->gtp_status != DEC_OK || pi->gtp_v1u ||
+                         pi->has_inner))
+        fail("GTP-U fields set without GTP-U", iter);
+    if (pi->has_inner && (!pi->gtp_v1u || pi->gtp_msg_type != GTPU_MSG_GPDU))
+        fail("inner packet outside a G-PDU", iter);
+    if (pi->has_inner && pi->inner_version != 4 && pi->inner_version != 6)
+        fail("bad inner IP version", iter);
+    if (pi->inner_has_l4 && !pi->has_inner)
+        fail("inner L4 decoded without inner L3", iter);
+    if (pi->gtp_nested && !(pi->inner_has_l4 &&
+                            pi->inner_proto == IPPROTO_NUM_UDP &&
+                            (pi->inner_src_port == GTPU_PORT ||
+                             pi->inner_dst_port == GTPU_PORT)))
+        fail("nested GTP-U flagged without inner UDP port 2152", iter);
+    if (pi->gtp_ext_count > GTPU_MAX_EXT_HEADERS)
+        fail("extension header chain longer than the limit", iter);
+    if (pi->gtp_v1u && pi->gtp_status == DEC_OK &&
+        pi->gtp_msg_type == GTPU_MSG_GPDU && !pi->has_inner)
+        fail("clean G-PDU without an inner packet", iter);
+    /* The cap/wire rule holds inside the tunnel as well. */
+    if (complete && decode_status_is_truncation(pi->gtp_status))
+        fail("complete frame's GTP-U message classified as truncated", iter);
+}
+
+/* Every field of two decode results, compared one by one (comparing the
+ * structs' bytes would also compare padding, whose value C leaves open). */
+static int same_info(const struct packet_info *a, const struct packet_info *b)
+{
+    return a->status == b->status && a->has_l2 == b->has_l2 &&
+           a->has_l3 == b->has_l3 && a->has_l4 == b->has_l4 &&
+           a->ethertype == b->ethertype && a->vlan_count == b->vlan_count &&
+           memcmp(a->vlan_ids, b->vlan_ids, sizeof a->vlan_ids) == 0 &&
+           a->ip_version == b->ip_version && a->ip_proto == b->ip_proto &&
+           memcmp(a->src_addr, b->src_addr, sizeof a->src_addr) == 0 &&
+           memcmp(a->dst_addr, b->dst_addr, sizeof a->dst_addr) == 0 &&
+           a->frag == b->frag && a->frag_id == b->frag_id &&
+           a->src_port == b->src_port && a->dst_port == b->dst_port &&
+           a->tcp_flags == b->tcp_flags && a->icmp_type == b->icmp_type &&
+           a->icmp_code == b->icmp_code &&
+           a->is_gtpu == b->is_gtpu && a->gtp_status == b->gtp_status &&
+           a->gtp_v1u == b->gtp_v1u && a->gtp_flags == b->gtp_flags &&
+           a->gtp_msg_type == b->gtp_msg_type && a->gtp_seq == b->gtp_seq &&
+           a->teid == b->teid && a->gtp_ext_count == b->gtp_ext_count &&
+           a->has_inner == b->has_inner &&
+           a->inner_has_l4 == b->inner_has_l4 &&
+           a->gtp_nested == b->gtp_nested &&
+           a->inner_version == b->inner_version &&
+           a->inner_proto == b->inner_proto &&
+           memcmp(a->inner_src, b->inner_src, sizeof a->inner_src) == 0 &&
+           memcmp(a->inner_dst, b->inner_dst, sizeof a->inner_dst) == 0 &&
+           a->inner_src_port == b->inner_src_port &&
+           a->inner_dst_port == b->inner_dst_port;
+}
+
+/* Decode the same `len` bytes again, now followed by random bytes. If the
+ * decoder never reads past caplen, nothing can change. ASan already flags
+ * an over-read of the exact-size buffer; this also catches one that a
+ * sanitizer-free build would not notice. */
+static void check_no_read_past_cap(const uint8_t *data, size_t len,
+                                   size_t wirelen,
+                                   const struct packet_info *want,
+                                   unsigned long long iter)
+{
+    uint8_t *padded = malloc(len + PAST_CAP_BYTES);
+    struct packet_info got;
+    size_t i;
+
+    if (padded == NULL) {
+        fprintf(stderr, "fuzz_decode: out of memory\n");
+        exit(1);
+    }
+    if (len > 0)
+        memcpy(padded, data, len);
+    for (i = len; i < len + PAST_CAP_BYTES; i++)
+        padded[i] = (uint8_t)rng();
+    decode_frame(padded, len, wirelen, &got);
+    free(padded);
+    if (!same_info(want, &got))
+        fail("result depends on bytes past caplen", iter);
 }
 
 /* Decode from an exact-size heap copy so ASan sees any over-read. */
@@ -210,7 +346,9 @@ static enum decode_status decode_exact(const uint8_t *data, size_t len,
     return st;
 }
 
-static size_t build_seeds(struct bytebuf *seeds)
+/* Build the seed frames. gtp_at[i] is the offset of the GTP-U header in
+ * seed i, or 0 if it has none. */
+static size_t build_seeds(struct bytebuf *seeds, size_t *gtp_at)
 {
     size_t n = 0;
     struct bytebuf *b;
@@ -285,12 +423,74 @@ static size_t build_seeds(struct bytebuf *seeds)
     b = &seeds[n++];                     /* ARP */
     put_eth(b, ETHERTYPE_ARP);
     bb_fill(b, 0, 28);
+
+    /* GTP-U seeds. The outer headers take 14 + 20 + 8 = 42 bytes, or
+     * 14 + 4 + 40 + 8 = 66 with a VLAN tag and IPv6. */
+    gtp_at[n] = 42;                      /* G-PDU, IPv4/TCP inside */
+    b = &seeds[n++];
+    put_eth(b, ETHERTYPE_IPV4);
+    put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 8 + 8 + 40 + 12, 0, 0);
+    put_udp(b, GTPU_PORT, GTPU_PORT, 8 + 40 + 12);
+    put_gtpu(b, 0x30, GTPU_MSG_GPDU, 40 + 12, 0x12345678u);
+    put_ipv4(b, IPPROTO_NUM_TCP, TEST_V4_B, TEST_V4_A, 20 + 12, 0, 0x4000);
+    put_tcp(b, 40000, 443, TCP_PSH | TCP_ACK);
+    bb_fill(b, 0x42, 12);
+
+    gtp_at[n] = 42;                      /* S + E, PDU Session Container,
+                                            IPv6/UDP inside */
+    b = &seeds[n++];
+    put_eth(b, ETHERTYPE_IPV4);
+    put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 8 + 8 + 64, 0, 0);
+    put_udp(b, GTPU_PORT, GTPU_PORT, 8 + 64);
+    put_gtpu(b, 0x36, GTPU_MSG_GPDU, 64, 0xBEEFu);
+    put_gtpu_opt(b, 1, 0, 0x85);
+    bb_u8(b, 1); bb_u8(b, 0x10); bb_u8(b, 9); bb_u8(b, 0);
+    put_ipv6(b, IPPROTO_NUM_UDP, TEST_V6_A, TEST_V6_B, 8 + 8);
+    put_udp(b, 50000, 53, 8);
+    bb_fill(b, 0, 8);
+
+    gtp_at[n] = 66;                      /* VLAN + IPv6 transport, a chain
+                                            of two extension headers, ICMP */
+    b = &seeds[n++];
+    put_eth(b, ETHERTYPE_VLAN);
+    put_vlan(b, 300, ETHERTYPE_IPV6);
+    put_ipv6(b, IPPROTO_NUM_UDP, TEST_V6_A, TEST_V6_B, 8 + 8 + 44);
+    put_udp(b, GTPU_PORT, GTPU_PORT, 8 + 44);
+    put_gtpu(b, 0x34, GTPU_MSG_GPDU, 44, 0xCAFE0001u);
+    put_gtpu_opt(b, 0, 0, 0x81);
+    put_gtpu_ext(b, 2, 0x85);
+    put_gtpu_ext(b, 1, 0);
+    put_ipv4(b, IPPROTO_NUM_ICMP, TEST_V4_B, TEST_V4_A, 8, 0, 0);
+    put_icmp(b, 0, 0);
+
+    gtp_at[n] = 42;                      /* Echo Request, from port 50000 */
+    b = &seeds[n++];
+    put_eth(b, ETHERTYPE_IPV4);
+    put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 8 + 8 + 4, 0, 0);
+    put_udp(b, 50000, GTPU_PORT, 8 + 4);
+    put_gtpu(b, 0x32, GTPU_MSG_ECHO_REQUEST, 4, 0);
+    put_gtpu_opt(b, 0x0102, 0, 0);
+
+    gtp_at[n] = 42;                      /* GTP-U inside GTP-U */
+    b = &seeds[n++];
+    put_eth(b, ETHERTYPE_IPV4);
+    put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 8 + 8 + 76, 0, 0);
+    put_udp(b, GTPU_PORT, GTPU_PORT, 8 + 76);
+    put_gtpu(b, 0x30, GTPU_MSG_GPDU, 76, 0x11);
+    put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_B, TEST_V4_A, 8 + 48, 0, 0);
+    put_udp(b, GTPU_PORT, GTPU_PORT, 48);
+    put_gtpu(b, 0x30, GTPU_MSG_GPDU, 40, 0x22);
+    put_ipv4(b, IPPROTO_NUM_TCP, TEST_V4_A, TEST_V4_B, 20, 0, 0);
+    put_tcp(b, 1, 2, TCP_SYN);
     return n;
 }
 
 struct totals {
     unsigned long long frames;
     unsigned long long by_status[DEC_STATUS_COUNT];
+    unsigned long long gtpu_frames;      /* frames decoded as GTP-U */
+    unsigned long long gtpu_inner;       /* ... with a valid inner packet */
+    unsigned long long gtpu_by_status[DEC_STATUS_COUNT];
     unsigned long long files;
     unsigned long long file_records;
     unsigned long long file_outcome[PCAP_ERR_BAD_CAPLEN + 1];
@@ -298,17 +498,29 @@ struct totals {
     unsigned long long addrs;
 };
 
+/* Decode a frame, check every invariant on the result, and check that the
+ * bytes after it made no difference. */
+static enum decode_status decode_checked(const uint8_t *data, size_t len,
+                                         size_t wirelen,
+                                         struct packet_info *pi,
+                                         unsigned long long iter)
+{
+    enum decode_status ds = decode_exact(data, len, wirelen, pi);
+
+    check_invariants(pi, ds, wirelen == len, iter);
+    check_no_read_past_cap(data, len, wirelen, pi, iter);
+    return ds;
+}
+
 /* Decode one record, check it, and account it like the real tool does. */
 static void process_record(const struct pcap_record *rec, struct analysis *an,
                            unsigned long long iter)
 {
     struct packet_info pi;
-    enum decode_status ds;
 
     if (rec->wirelen < rec->caplen)
         fail("record wire length below captured length", iter);
-    ds = decode_exact(rec->data, rec->caplen, rec->wirelen, &pi);
-    check_invariants(&pi, ds, rec->wirelen == rec->caplen, iter);
+    decode_checked(rec->data, rec->caplen, rec->wirelen, &pi, iter);
     if (analysis_account(an, &pi, rec->caplen, rec->wirelen, rec->ts_ns) != 0)
         fail("flow table out of memory", iter);
 }
@@ -462,16 +674,52 @@ static void fuzz_addr(struct totals *tot, unsigned long long iter)
     tot->addrs++;
 }
 
-/* Write the summary, the top-N table and the CSV for whatever the fuzzed
- * inputs left in the flow table, and check the CSV's shape. */
-static void fuzz_reports(const struct analysis *an)
+/* Print the top (at most) 100 entries of a flow or tunnel table. */
+static size_t print_top(FILE *f, const struct flow_table *t, int tunnels)
 {
-    struct pcap_file_info info;
-    const struct flow **top;
-    size_t n = an->flows.count < 100 ? an->flows.count : 100;
+    size_t n = t->count < 100 ? t->count : 100;
+    const struct flow **top = malloc((n ? n : 1) * sizeof *top);
+
+    if (top == NULL)
+        exit(1);
+    n = flow_table_top_n(t, n, top);
+    if (tunnels)
+        report_top_tunnels(f, top, n, t->count);
+    else
+        report_top_flows(f, top, n, t->count);
+    free(top);
+    return n;
+}
+
+/* Write a CSV of `t` to a temporary file and check it has one row per
+ * entry plus a header. */
+static void check_csv(const struct flow_table *t,
+                      int (*writer)(FILE *, const struct flow_table *),
+                      const char *what)
+{
     unsigned long long lines = 0;
     FILE *f = tmpfile();
     int c;
+
+    if (f == NULL)
+        fail("cannot create temporary file for CSV", 0);
+    if (writer(f, t) != 0)
+        fail("CSV write failed", 0);
+    rewind(f);
+    while ((c = getc(f)) != EOF)
+        lines += c == '\n';
+    fclose(f);
+    if (lines != (unsigned long long)t->count + 1)
+        fail(what, 0);
+}
+
+/* Write the summary, the GTP-U section, both top-N tables and both CSVs
+ * for whatever the fuzzed inputs left in the tables. */
+static void fuzz_reports(const struct analysis *an)
+{
+    struct pcap_file_info info;
+    size_t n_flows, n_tunnels;
+    FILE *f = tmpfile();
 
     if (f == NULL)
         fail("cannot create temporary file for reports", 0);
@@ -479,35 +727,28 @@ static void fuzz_reports(const struct analysis *an)
     info.version_major = 2;
     info.version_minor = 4;
     report_summary(f, "fuzz", &info, &an->stats, an->flows.count);
-    top = malloc((n ? n : 1) * sizeof *top);
-    if (top == NULL)
-        exit(1);
-    n = flow_table_top_n(&an->flows, n, top);
-    report_top_flows(f, top, n, an->flows.count);
-    free(top);
+    n_flows = print_top(f, &an->flows, 0);
+    if (report_gtpu(f, &an->stats, &an->tunnels) != 0)
+        fail("GTP-U report failed", 0);
+    n_tunnels = print_top(f, &an->tunnels, 1);
     if (ferror(f))
         fail("report write failed", 0);
     fclose(f);
 
-    f = tmpfile();
-    if (f == NULL)
-        fail("cannot create temporary file for CSV", 0);
-    if (report_csv(f, &an->flows) != 0)
-        fail("CSV write failed", 0);
-    rewind(f);
-    while ((c = getc(f)) != EOF)
-        lines += c == '\n';
-    fclose(f);
-    if (lines != (unsigned long long)an->flows.count + 1)
-        fail("CSV does not have one row per flow plus a header", 0);
-    printf("reports: summary, top %zu table and %zu-row CSV written\n", n,
-           an->flows.count);
+    check_csv(&an->flows, report_csv,
+              "CSV does not have one row per flow plus a header");
+    check_csv(&an->tunnels, report_tunnels_csv,
+              "tunnels CSV does not have one row per tunnel plus a header");
+    printf("reports: summary, GTP-U section, top %zu flow and top %zu tunnel "
+           "tables, %zu-row and %zu-row CSVs written\n", n_flows, n_tunnels,
+           an->flows.count, an->tunnels.count);
 }
 
 int main(int argc, char **argv)
 {
     unsigned long long iterations = 200000, seed = 1, i;
     struct bytebuf seeds[MAX_SEEDS];
+    size_t gtp_at[MAX_SEEDS] = {0};
     size_t nseeds, k;
     struct analysis an;
     struct totals tot;
@@ -524,28 +765,37 @@ int main(int argc, char **argv)
 
     for (k = 0; k < MAX_SEEDS; k++)
         bb_init(&seeds[k]);
-    nseeds = build_seeds(seeds);
+    nseeds = build_seeds(seeds, gtp_at);
     memset(&tot, 0, sizeof tot);
     if (analysis_init(&an) != 0)
         return 1;
 
     for (i = 0; i < iterations; i++) {
-        const struct bytebuf *s = &seeds[rng_below(nseeds)];
+        size_t which = rng_below(nseeds);
+        const struct bytebuf *s = &seeds[which];
         size_t len = s->len;
         size_t wirelen;
         struct packet_info pi;
         enum decode_status ds;
 
         memcpy(work, s->data, len);
+        /* Half the GTP-U seeds get a change aimed at the GTP-U fields
+         * first; the generic mutations below apply to every seed. */
+        if (gtp_at[which] != 0 && (rng() & 1))
+            mutate_gtpu(work, len, gtp_at[which]);
         mutate(work, &len, sizeof work);
         /* Half the time claim the frame was longer on the wire, as with a
          * snapshot length, to exercise the truncated-vs-malformed logic. */
         wirelen = (rng() & 1) ? len : len + rng_below(3000);
 
-        ds = decode_exact(work, len, wirelen, &pi);
-        check_invariants(&pi, ds, wirelen == len, i);
+        ds = decode_checked(work, len, wirelen, &pi, i);
         tot.frames++;
         tot.by_status[ds]++;
+        if (pi.is_gtpu) {
+            tot.gtpu_frames++;
+            tot.gtpu_by_status[pi.gtp_status]++;
+            tot.gtpu_inner += pi.has_inner;
+        }
         if (analysis_account(&an, &pi, (uint32_t)len, (uint32_t)wirelen,
                              i) != 0)
             fail("flow table out of memory", i);
@@ -563,6 +813,14 @@ int main(int argc, char **argv)
                    decode_status_str((enum decode_status)k),
                    tot.by_status[k]);
     }
+    printf("GTP-U: %llu of those frames decoded as GTP-U, %llu with a valid "
+           "inner packet\n", tot.gtpu_frames, tot.gtpu_inner);
+    for (k = 0; k < DEC_STATUS_COUNT; k++) {
+        if (tot.gtpu_by_status[k] > 0)
+            printf("  %-38s %llu\n",
+                   decode_status_str((enum decode_status)k),
+                   tot.gtpu_by_status[k]);
+    }
     printf("reader: %llu mutated pcap files (each read from memory and "
            "through stdio), %llu records decoded\n",
            tot.files, tot.file_records);
@@ -573,8 +831,9 @@ int main(int argc, char **argv)
     }
     printf("addresses: %llu IPv6 addresses checked against inet_ntop\n",
            tot.addrs);
-    printf("flow table: %zu flows, %llu later fragments matched\n",
-           an.flows.count, (unsigned long long)an.stats.frag_matched);
+    printf("flow table: %zu flows, %llu later fragments matched; tunnel "
+           "table: %zu tunnels\n", an.flows.count,
+           (unsigned long long)an.stats.frag_matched, an.tunnels.count);
     fuzz_reports(&an);
     printf("result: no crashes, no sanitizer reports, all invariants held\n");
 

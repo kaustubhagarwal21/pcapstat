@@ -768,9 +768,12 @@ static void test_status_strings(void)
     CHECK(!decode_status_is_truncation(DEC_OK));
     CHECK(decode_status_is_truncation(DEC_TRUNC_ETHERNET));
     CHECK(decode_status_is_truncation(DEC_TRUNC_ICMP));
+    CHECK(decode_status_is_truncation(DEC_TRUNC_GTPU));
+    CHECK(decode_status_is_truncation(DEC_TRUNC_GTPU_INNER));
     CHECK(!decode_status_is_truncation(DEC_BAD_SHORT_FRAME));
     CHECK(!decode_status_is_truncation(DEC_BAD_VLAN_DEPTH));
     CHECK(!decode_status_is_truncation(DEC_BAD_UDP_LEN));
+    CHECK(!decode_status_is_truncation(DEC_BAD_GTPU_INNER));
 }
 
 void run_decode_tests(void)

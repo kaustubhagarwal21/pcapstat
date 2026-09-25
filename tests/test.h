@@ -45,5 +45,6 @@ void run_pcap_tests(void);
 void run_decode_tests(void);
 void run_flow_tests(void);
 void run_report_tests(void);
+void run_gtpu_tests(void);
 
 #endif /* PCAPSTAT_TEST_H */

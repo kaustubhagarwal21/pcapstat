@@ -1,13 +1,15 @@
 #!/bin/sh
-# cli_test.sh - command-line behaviour: exit codes, output, CSV file.
+# cli_test.sh - command-line behaviour: exit codes, output, CSV files.
 #
 #   sh tests/cli_test.sh ./build/pcapstat build
 #
-# Uses the committed sample capture (samples/sample.pcap).
+# Uses the committed sample captures (samples/sample.pcap and
+# samples/gtpu_sample.pcap).
 
 BIN=${1:?usage: cli_test.sh PCAPSTAT_BINARY TMPDIR}
 TMP=${2:-.}
 SAMPLE=samples/sample.pcap
+GTPU=samples/gtpu_sample.pcap
 pass=0
 fail=0
 
@@ -101,8 +103,61 @@ else
     echo "FAIL  cli: input file was modified"
 fi
 
+# GTP-U: the summary section, the tunnel table and the tunnels CSV.
+expect_exit 0 "GTP-U sample capture" -- \
+    "$BIN" -n 3 --tunnels-csv "$TMP/cli_tunnels.csv" "$GTPU"
+expect_grep "^GTP-U: " "$TMP/cli_out.txt" "GTP-U section printed"
+expect_grep "^Top 3 of [0-9]* GTP-U tunnels" "$TMP/cli_out.txt" \
+    "top-N tunnel table printed"
+expect_grep "^teid,src_addr,dst_addr,ip_version,packets,bytes,first_ts,last_ts,duration_s$" \
+    "$TMP/cli_tunnels.csv" "tunnels CSV header row"
+
+# One CSV row per tunnel: rows = the "Tunnels:" count from the summary.
+tunnels=$(sed -n 's/^  Tunnels: *\([0-9]*\).*/\1/p' "$TMP/cli_out.txt")
+rows=$(($(wc -l <"$TMP/cli_tunnels.csv") - 1))
+if [ -n "$tunnels" ] && [ "$tunnels" = "$rows" ]; then
+    pass=$((pass + 1))
+    echo "ok    cli: tunnels CSV has one row per tunnel ($rows)"
+else
+    fail=$((fail + 1))
+    echo "FAIL  cli: tunnels CSV rows $rows != tunnels $tunnels"
+fi
+
+expect_exit 0 "-n 0 hides the tunnel table too" -- "$BIN" -n 0 "$GTPU"
+if grep -q "^Top " "$TMP/cli_out.txt"; then
+    fail=$((fail + 1))
+    echo "FAIL  cli: a table printed with -n 0"
+else
+    pass=$((pass + 1))
+    echo "ok    cli: no tables with -n 0"
+fi
+
+expect_exit 0 "capture without GTP-U" -- "$BIN" "$SAMPLE"
+if grep -q "GTP-U" "$TMP/cli_out.txt"; then
+    fail=$((fail + 1))
+    echo "FAIL  cli: GTP-U section printed for a capture without GTP-U"
+else
+    pass=$((pass + 1))
+    echo "ok    cli: no GTP-U section without GTP-U traffic"
+fi
+
+expect_exit 1 "--tunnels-csv without a value" -- "$BIN" "$GTPU" --tunnels-csv
+expect_exit 1 "--csv and --tunnels-csv naming the same file" -- \
+    "$BIN" --csv "$TMP/cli_same.csv" --tunnels-csv "$TMP/cli_same.csv" "$GTPU"
+cp "$GTPU" "$TMP/cli_copy.pcap"
+expect_exit 1 "--tunnels-csv same as the input file" -- \
+    "$BIN" --tunnels-csv "$TMP/cli_copy.pcap" "$TMP/cli_copy.pcap"
+if cmp -s "$GTPU" "$TMP/cli_copy.pcap"; then
+    pass=$((pass + 1))
+    echo "ok    cli: input file left untouched by --tunnels-csv"
+else
+    fail=$((fail + 1))
+    echo "FAIL  cli: input file was modified by --tunnels-csv"
+fi
+
 rm -f "$TMP"/cli_out.txt "$TMP"/cli_err.txt "$TMP"/cli_not_pcap.txt \
-    "$TMP"/cli_truncated.pcap "$TMP"/cli_flows.csv "$TMP"/cli_copy.pcap
+    "$TMP"/cli_truncated.pcap "$TMP"/cli_flows.csv "$TMP"/cli_copy.pcap \
+    "$TMP"/cli_tunnels.csv "$TMP"/cli_same.csv
 echo
 echo "$pass cli checks passed, $fail failed"
 [ "$fail" -eq 0 ]

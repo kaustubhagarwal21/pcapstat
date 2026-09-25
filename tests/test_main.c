@@ -54,6 +54,7 @@ int main(int argc, char **argv)
     run_decode_tests();
     run_flow_tests();
     run_report_tests();
+    run_gtpu_tests();
 
     printf("\n%d tests, %d checks, %d failed\n", tests_run, checks_run,
            tests_failed);

@@ -48,6 +48,16 @@ void put_udp(struct bytebuf *b, unsigned sport, unsigned dport,
              size_t payload_len);
 /* 8-byte ICMP/ICMPv6 echo-style header. */
 void put_icmp(struct bytebuf *b, unsigned type, unsigned code);
+/* 8-byte GTPv1-U header. `flags` is the whole first byte (0x30: version 1,
+ * PT 1, no optional fields); `length` counts the bytes after these 8. */
+void put_gtpu(struct bytebuf *b, unsigned flags, unsigned type,
+              size_t length, uint32_t teid);
+/* The 4 optional bytes that follow when E, S or PN is set. */
+void put_gtpu_opt(struct bytebuf *b, unsigned seq, unsigned npdu,
+                  unsigned next_type);
+/* A GTP-U extension header of `units` 4-byte units (at least 1): length
+ * byte, zero content, then the next extension header type. */
+void put_gtpu_ext(struct bytebuf *b, unsigned units, unsigned next_type);
 
 /* --- whole frames ---------------------------------------------------- */
 

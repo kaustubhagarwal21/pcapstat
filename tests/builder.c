@@ -181,6 +181,30 @@ void put_icmp(struct bytebuf *b, unsigned type, unsigned code)
     bb_be16(b, 1);       /* sequence */
 }
 
+void put_gtpu(struct bytebuf *b, unsigned flags, unsigned type,
+              size_t length, uint32_t teid)
+{
+    bb_u8(b, flags);
+    bb_u8(b, type);
+    bb_be16(b, (unsigned)length);
+    bb_be32(b, teid);
+}
+
+void put_gtpu_opt(struct bytebuf *b, unsigned seq, unsigned npdu,
+                  unsigned next_type)
+{
+    bb_be16(b, seq);
+    bb_u8(b, npdu);
+    bb_u8(b, next_type);
+}
+
+void put_gtpu_ext(struct bytebuf *b, unsigned units, unsigned next_type)
+{
+    bb_u8(b, units);
+    bb_fill(b, 0, 4 * (size_t)units - 2);
+    bb_u8(b, next_type);
+}
+
 void frame_v4_tcp(struct bytebuf *b, const uint8_t src[4],
                   const uint8_t dst[4], unsigned sport, unsigned dport,
                   unsigned flags, size_t payload)

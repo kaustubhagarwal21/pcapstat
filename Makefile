@@ -22,7 +22,8 @@ LIB_SRC := src/pcap_reader.c src/decode.c src/flow.c src/frag.c src/stats.c \
            src/addr.c src/report.c src/analyze.c
 HEADERS := $(wildcard src/*.h)
 TEST_SRC := tests/test_main.c tests/builder.c tests/test_pcap.c \
-            tests/test_decode.c tests/test_flow.c tests/test_report.c
+            tests/test_decode.c tests/test_flow.c tests/test_report.c \
+            tests/test_gtpu.c
 TEST_HDR := tests/test.h tests/builder.h
 
 FUZZ_ITERS ?= 200000
@@ -75,12 +76,16 @@ bench: $(BUILD)/pcapstat $(BENCH_PCAP)
 	@echo "timing: ./$(BUILD)/pcapstat -n 5 $(BENCH_PCAP)"
 	@bash -c 'time ./$(BUILD)/pcapstat -n 5 $(BENCH_PCAP) > /dev/null'
 
-# Regenerate the small committed sample capture. Seed 17 was picked because
+# Regenerate the small committed sample captures. Seed 17 was picked because
 # its 400 packets include every protocol path (ICMP, ICMPv6, IPv4 fragments,
-# VLAN tags, non-IP frames) alongside TCP and UDP.
+# VLAN tags, non-IP frames) alongside TCP and UDP. Seed 2 of the GTP-U sample
+# has TCP, UDP, ICMP and ICMPv6 inside the tunnels, IPv4 and IPv6 on both
+# levels, sequence numbers, extension headers and an End Marker.
 sample:
 	$(PYTHON) tools/gen_pcap.py --seed 17 --packets 400 --flows 30 \
 	    --out samples/sample.pcap
+	$(PYTHON) tools/gen_pcap.py --seed 2 --packets 300 --flows 6 \
+	    --gtp-fraction 0.9 --out samples/gtpu_sample.pcap
 
 clean:
 	rm -rf $(BUILD)

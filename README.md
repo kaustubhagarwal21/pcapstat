@@ -690,14 +690,14 @@ with clang 17.0.6 (`make CC=/usr/lib/llvm-17/bin/clang ...`). CI runs `make`, `m
 
 ## Benchmarks
 
-`./build/pcapstat -n 5` on two generated 1,000,000-packet captures, one of
-ordinary traffic and one mostly GTP-U: one warm-up run, then 5 timed runs
-each. The files sat on WSL's own ext4 file system and were in the page
-cache, so this measures parsing, decoding and counting, not the disk. Each
-run was started by a small C helper that forks, `exec`s pcapstat with stdout
-sent to `/dev/null`, and waits with `wait4()`. Wall time comes from
-`CLOCK_MONOTONIC` around the whole process; peak RSS is `ru_maxrss`. All the
-figures below come from one session.
+`./build/pcapstat -n 5` on three generated 1,000,000-packet captures: one
+of ordinary traffic, one mostly GTP-U and one half GTP-U. Each got one
+warm-up run, then 5 timed runs. The files sat on WSL's own ext4 file system
+and were in the page cache, so this measures parsing, decoding and
+counting, not the disk. Each run was started by a small C helper that
+forks, `exec`s pcapstat with stdout sent to `/dev/null`, and waits with
+`wait4()`. Wall time comes from `CLOCK_MONOTONIC` around the whole process;
+peak RSS is `ru_maxrss`. The first two tables come from one session.
 
 | | |
 |---|---|
@@ -724,13 +724,26 @@ GTP-U traffic:
 | Peak RSS | **18.3–18.4 MiB** (18,688–18,808 KiB). The tunnel table has grown to 131,072 slots of 88 bytes (11 MiB) |
 | With `--tunnels-csv` (71,469 rows) | median 0.272 s (range 0.268–0.274 s), 3.68 million packets/s |
 
+Half GTP-U traffic, measured later for v0.2.0 in a separate session. In
+that session the two captures above had medians of 0.168 s (range
+0.166–0.172 s) and 0.228 s (range 0.220–0.235 s). Both are within
+run-to-run noise of the figures above, so those were kept.
+
+| | |
+|---|---|
+| Capture | `python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --gtp-fraction 0.5 --out ~/bench_gtp50_1m.pcap` (generated in 12.6 s): 680,441,006 bytes, SHA-256 `a34c8154…7dfc078`, 510 s of traffic; 493,113 GTP-U packets, 489,007 of them G-PDUs; 39,747 tunnels and 19,634 outer flows |
+| Wall time | median **0.202 s** over 5 runs (range 0.196–0.205 s) |
+| Throughput at the median | **4.94 million packets/s**; 3,364 MB/s of capture file |
+| Peak RSS | **12.2–12.3 MiB** (12,500–12,636 KiB). The tunnel table has 65,536 slots of 88 bytes (5.5 MiB) |
+| With `--tunnels-csv` (39,747 rows) | median 0.231 s (range 0.228–0.242 s), 4.33 million packets/s |
+
 pcapstat is single-threaded, so these figures are for one core.
 
-**What GTP-U support costs on traffic without GTP-U.** In the same
-session, the previous commit (before GTP-U) and this one were each run 25
-times, interleaved, on the first capture. The medians were 0.157 s and
-0.169 s, so this commit is about 8% slower. Five variants each undid or
-worked around one part of the change:
+**What GTP-U support costs on traffic without GTP-U.** In the session of
+the first two tables, the last commit before GTP-U and the commit that
+added it were each run 25 times, interleaved, on the first capture. The
+medians were 0.157 s and 0.169 s, so GTP-U support made it about 8%
+slower. Five variants each undid or worked around one part of the change:
 
 - the TEID left out of the flow hash;
 - the GTP-U dispatch removed from the decoder;
@@ -747,6 +760,7 @@ To reproduce the runs:
 ```sh
 python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --out ~/bench_1m.pcap
 python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 2000 --gtp-fraction 0.9 --out ~/bench_gtp_1m.pcap
+python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --gtp-fraction 0.5 --out ~/bench_gtp50_1m.pcap
 make
 ./build/pcapstat -n 5 ~/bench_1m.pcap > /dev/null          # warm-up
 for i in 1 2 3 4 5; do /usr/bin/time -f '%e s %M KiB' ./build/pcapstat -n 5 ~/bench_1m.pcap > /dev/null; done

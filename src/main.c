@@ -125,6 +125,13 @@ int main(int argc, char **argv)
         usage(stderr);
         return EXIT_USAGE;
     }
+    /* `--csv cap.pcap cap.pcap` would overwrite the capture with the CSV.
+     * Comparing names catches that slip; a different spelling of the same
+     * path (./cap.pcap) is not caught, which would need POSIX stat(). */
+    if (csv_path != NULL && strcmp(csv_path, pcap_path) == 0) {
+        fprintf(stderr, "pcapstat: --csv file must not be the input file\n");
+        return EXIT_USAGE;
+    }
 
     st = pcap_open_file(&reader, pcap_path);
     if (st != PCAP_OK) {

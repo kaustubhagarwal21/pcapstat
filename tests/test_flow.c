@@ -5,9 +5,10 @@
 #include <string.h>
 
 #include "addr.h"
-#include "flow.h"
-#include "test.h"
 #include "builder.h"
+#include "flow.h"
+#include "frag.h"
+#include "test.h"
 
 /* A decoded-packet stand-in with only the fields the flow code reads. */
 static struct packet_info make_pkt(int version, uint8_t proto,
@@ -347,6 +348,114 @@ static void test_addr_format(void)
     CHECK(strcmp(buf, "192") == 0);
 }
 
+static void test_addr_format_v4_mapped(void)
+{
+    static const uint8_t mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                                       0, 0, 0xff, 0xff, 192, 0, 2, 1};
+    static const uint8_t mapped0[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0xff, 0xff, 0, 0, 0, 0};
+    static const uint8_t near[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                                     0, 0, 0xff, 0xfe, 1, 2, 3, 4};
+    static const uint8_t not_zero[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                                         0, 1, 0xff, 0xff, 1, 2, 3, 4};
+    static const uint8_t compat[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                                       0, 0, 0, 0, 1, 2, 3, 4};
+
+    /* RFC 5952 section 5: mixed notation for the IPv4-mapped prefix. */
+    check_v6("::ffff:192.0.2.1", mapped);
+    check_v6("::ffff:0.0.0.0", mapped0);
+    /* Not the mapped prefix: plain hex. */
+    check_v6("::fffe:102:304", near);
+    check_v6("::1:ffff:102:304", not_zero);
+    /* The deprecated IPv4-compatible form (RFC 4291) stays hex. */
+    check_v6("::102:304", compat);
+}
+
+/* A decoded fragment stand-in for the fragment cache. */
+static struct packet_info frag_pkt(enum frag_kind kind, uint32_t id,
+                                   uint16_t sport, uint16_t dport)
+{
+    struct packet_info pi;
+
+    memset(&pi, 0, sizeof pi);
+    pi.status = DEC_OK;
+    pi.has_l2 = pi.has_l3 = 1;
+    pi.has_l4 = kind != FRAG_LATER;
+    pi.ip_version = 4;
+    pi.ip_proto = IPPROTO_NUM_UDP;
+    memcpy(pi.src_addr, TEST_V4_A, 4);
+    memcpy(pi.dst_addr, TEST_V4_B, 4);
+    pi.frag = kind;
+    pi.frag_id = id;
+    pi.src_port = sport;
+    pi.dst_port = dport;
+    return pi;
+}
+
+static void test_frag_cache(void)
+{
+    struct frag_cache c;
+    struct packet_info first = frag_pkt(FRAG_FIRST, 77, 4444, 5555);
+    struct packet_info later = frag_pkt(FRAG_LATER, 77, 0, 0);
+    struct packet_info other_id = frag_pkt(FRAG_LATER, 78, 0, 0);
+    struct packet_info other_dst = frag_pkt(FRAG_LATER, 77, 0, 0);
+    struct packet_info early = frag_pkt(FRAG_LATER, 90, 0, 0);
+    struct packet_info bad = frag_pkt(FRAG_LATER, 77, 0, 0);
+
+    CHECK_EQ(frag_cache_init(&c), 0);
+
+    /* A later fragment seen before its first one stays port-less. */
+    CHECK_EQ(frag_cache_apply(&c, &early), 0);
+    CHECK_EQ(early.src_port, 0);
+
+    CHECK_EQ(frag_cache_apply(&c, &first), 0);  /* records, fills nothing */
+    CHECK_EQ(frag_cache_apply(&c, &later), 1);
+    CHECK_EQ(later.src_port, 4444);
+    CHECK_EQ(later.dst_port, 5555);
+    CHECK(!later.has_l4);                        /* still not L4-decoded */
+
+    /* Same addresses, different datagram; same ID, different peer. */
+    CHECK_EQ(frag_cache_apply(&c, &other_id), 0);
+    CHECK_EQ(other_id.src_port, 0);
+    other_dst.dst_addr[3] = 99;
+    CHECK_EQ(frag_cache_apply(&c, &other_dst), 0);
+
+    /* Only cleanly decoded packets take part. */
+    bad.status = DEC_BAD_UDP_LEN;
+    CHECK_EQ(frag_cache_apply(&c, &bad), 0);
+    frag_cache_free(&c);
+}
+
+/* Many datagrams in flight: most still find their ports in the fixed-size
+ * cache, and a collision only ever loses attribution, never mixes it up. */
+static void test_frag_cache_many(void)
+{
+    enum { N = 1000 };
+    struct frag_cache c;
+    uint32_t id;
+    int matched = 0, wrong = 0;
+
+    CHECK_EQ(frag_cache_init(&c), 0);
+    for (id = 0; id < N; id++) {
+        struct packet_info first = frag_pkt(FRAG_FIRST, id,
+                                            (uint16_t)(1000 + id), 53);
+        frag_cache_apply(&c, &first);
+    }
+    for (id = 0; id < N; id++) {
+        struct packet_info later = frag_pkt(FRAG_LATER, id, 0, 0);
+
+        if (frag_cache_apply(&c, &later)) {
+            matched++;
+            if (later.src_port != (uint16_t)(1000 + id) ||
+                later.dst_port != 53)
+                wrong++;
+        }
+    }
+    CHECK(matched > N / 2);
+    CHECK_EQ(wrong, 0);
+    frag_cache_free(&c);
+}
+
 void run_flow_tests(void)
 {
     RUN_TEST(test_flow_key_normalization);
@@ -359,4 +468,7 @@ void run_flow_tests(void)
     RUN_TEST(test_top_n_ordering);
     RUN_TEST(test_top_n_matches_full_sort);
     RUN_TEST(test_addr_format);
+    RUN_TEST(test_addr_format_v4_mapped);
+    RUN_TEST(test_frag_cache);
+    RUN_TEST(test_frag_cache_many);
 }

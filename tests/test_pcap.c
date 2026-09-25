@@ -197,6 +197,32 @@ static void test_max_caplen_accepted(void)
     free(big);
 }
 
+/* Regression: origlen < caplen used to be passed through, so a capture could
+ * report fewer bytes on the wire than captured. */
+static void test_wirelen_below_caplen_raised(void)
+{
+    struct bytebuf b;
+    struct pcap_reader r;
+    struct pcap_record rec;
+    uint8_t frame[108];
+
+    memset(frame, 0, sizeof frame);
+    bb_init(&b);
+    pcap_put_global(&b, 0, 0, 65535, 1);
+    pcap_put_record(&b, 0, 1, 0, frame, 108, 10);  /* origlen 10 < 108 */
+    pcap_put_record(&b, 0, 2, 0, frame, 60, 1514); /* normal snapped record */
+
+    CHECK_EQ(pcap_open_mem(&r, b.data, b.len), PCAP_OK);
+    CHECK_EQ(pcap_next(&r, &rec), PCAP_OK);
+    CHECK_EQ(rec.caplen, 108);
+    CHECK_EQ(rec.wirelen, 108);
+    CHECK_EQ(pcap_next(&r, &rec), PCAP_OK);
+    CHECK_EQ(rec.caplen, 60);
+    CHECK_EQ(rec.wirelen, 1514);                   /* left alone */
+    CHECK_EQ(pcap_next(&r, &rec), PCAP_EOF);
+    bb_free(&b);
+}
+
 static void test_empty_capture(void)
 {
     struct bytebuf b;
@@ -258,6 +284,48 @@ static void test_file_reader(void)
     bb_free(&frame);
 }
 
+/* The stream entry point, through tmpfile(): same records as memory input,
+ * and a short stream fails cleanly (the reader closes the stream). */
+static void test_open_stream(void)
+{
+    struct bytebuf b;
+    struct pcap_reader r;
+    struct pcap_record rec;
+    FILE *f;
+
+    CHECK_EQ(pcap_open_stream(&r, NULL), PCAP_ERR_OPEN);
+
+    bb_init(&b);
+    pcap_put_global(&b, 1, 0, 65535, 1);
+    pcap_put_record(&b, 1, 7, 8, payload8, 8, 100);
+    f = tmpfile();
+    CHECK(f != NULL);
+    if (f == NULL) {
+        bb_free(&b);
+        return;
+    }
+    CHECK_EQ(fwrite(b.data, 1, b.len, f), b.len);
+    rewind(f);
+    CHECK_EQ(pcap_open_stream(&r, f), PCAP_OK);
+    CHECK_EQ(pcap_next(&r, &rec), PCAP_OK);
+    CHECK_EQ(rec.caplen, 8);
+    CHECK_EQ(rec.wirelen, 100);
+    CHECK_EQ(rec.ts_ns, 7000000000ull + 8000ull);
+    CHECK(memcmp(rec.data, payload8, 8) == 0);
+    CHECK_EQ(pcap_next(&r, &rec), PCAP_EOF);
+    pcap_close(&r);
+
+    f = tmpfile();
+    CHECK(f != NULL);
+    if (f != NULL) {
+        CHECK_EQ(fwrite(b.data, 1, 20, f), 20);
+        rewind(f);
+        CHECK_EQ(pcap_open_stream(&r, f), PCAP_ERR_SHORT_HEADER);
+        pcap_close(&r); /* safe: the failed open already closed f */
+    }
+    bb_free(&b);
+}
+
 static void test_file_errors(void)
 {
     struct pcap_reader r;
@@ -292,7 +360,9 @@ void run_pcap_tests(void)
     RUN_TEST(test_truncated_record_data);
     RUN_TEST(test_oversized_caplen);
     RUN_TEST(test_max_caplen_accepted);
+    RUN_TEST(test_wirelen_below_caplen_raised);
     RUN_TEST(test_empty_capture);
     RUN_TEST(test_file_reader);
+    RUN_TEST(test_open_stream);
     RUN_TEST(test_file_errors);
 }

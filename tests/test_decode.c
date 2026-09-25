@@ -186,10 +186,56 @@ static void test_vlan_errors(void)
     CHECK(!pi.has_l3);
     bb_free(&b);
 
-    /* Tag cut off after 2 of its 4 bytes. */
+    /* Tag cut off after 2 of its 4 bytes. If the frame was longer on the
+     * wire, the capture stopped early: truncated. If those 16 bytes are the
+     * whole frame, the frame itself is too short: malformed. */
     put_eth(&b, ETHERTYPE_VLAN);
     bb_be16(&b, 7);
-    CHECK_EQ(decode_all(&b, &pi), DEC_TRUNC_VLAN);
+    CHECK_EQ(decode_snap(&b, b.len, b.len + 100, &pi), DEC_TRUNC_VLAN);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_SHORT_FRAME);
+    bb_free(&b);
+}
+
+/* Regression: a complete frame (caplen == wire length) that ends inside a
+ * fixed-size header used to be reported as truncated, like a snapshot-length
+ * cut. It is malformed; only a frame that was longer on the wire is
+ * truncated. One case per fixed-size header. */
+static void test_complete_short_frame_is_malformed(void)
+{
+    struct bytebuf b;
+    struct packet_info pi;
+
+    /* 10 of the Ethernet header's 14 bytes. */
+    bb_init(&b);
+    bb_fill(&b, 0x02, 10);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_SHORT_FRAME);
+    CHECK_EQ(decode_snap(&b, b.len, 60, &pi), DEC_TRUNC_ETHERNET);
+    bb_free(&b);
+
+    /* 10 of the IPv4 header's 20 bytes. */
+    put_eth(&b, ETHERTYPE_IPV4);
+    bb_be32(&b, 0x45000028u);
+    bb_fill(&b, 0, 6);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_SHORT_FRAME);
+    CHECK(pi.has_l2 && !pi.has_l3);
+    CHECK_EQ(decode_snap(&b, b.len, 1514, &pi), DEC_TRUNC_IPV4);
+    bb_free(&b);
+
+    /* 30 of the IPv6 header's 40 bytes. */
+    put_eth(&b, ETHERTYPE_IPV6);
+    bb_u8(&b, 0x60);
+    bb_fill(&b, 0, 29);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_SHORT_FRAME);
+    CHECK_EQ(decode_snap(&b, b.len, 1514, &pi), DEC_TRUNC_IPV6);
+    bb_free(&b);
+
+    /* Inside a second VLAN tag. */
+    put_eth(&b, ETHERTYPE_QINQ);
+    put_vlan(&b, 10, ETHERTYPE_VLAN);
+    bb_u8(&b, 0);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_SHORT_FRAME);
+    CHECK_EQ(pi.vlan_count, 1);
+    CHECK_EQ(decode_snap(&b, b.len, 1514, &pi), DEC_TRUNC_VLAN);
     bb_free(&b);
 }
 
@@ -428,6 +474,76 @@ static void test_bad_ipv4_total_len(void)
     bb_free(&b);
 }
 
+/* Total length 0, as in packets captured on a sender using TCP segmentation
+ * offload: taken to mean "to the end of the frame". */
+static void test_ipv4_total_len_zero_tso(void)
+{
+    struct bytebuf b;
+    struct packet_info pi;
+
+    bb_init(&b);
+    frame_v4_tcp(&b, TEST_V4_A, TEST_V4_B, 50000, 443, TCP_PSH | TCP_ACK,
+                 3000);             /* a 3054-byte "super-frame" */
+    b.data[16] = 0;
+    b.data[17] = 0;
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK(pi.has_l4);
+    CHECK_EQ(pi.src_port, 50000);
+    CHECK_EQ(pi.dst_port, 443);
+    /* Still bounded by the frame: headers alone must fit. */
+    CHECK_EQ(decode_snap(&b, 14 + 20 + 20, b.len, &pi), DEC_OK);
+    CHECK_EQ(decode_snap(&b, 14 + 20 + 10, 14 + 20 + 10, &pi),
+             DEC_BAD_L4_LEN);
+    bb_free(&b);
+}
+
+static void test_fragment_ids(void)
+{
+    struct bytebuf b;
+    struct packet_info pi;
+
+    bb_init(&b);
+    put_eth(&b, ETHERTYPE_IPV4);
+    put_ipv4(&b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 16, 0, 185);
+    bb_fill(&b, 0, 16);
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.frag_id, 0x1234);   /* put_ipv4's identification */
+    bb_free(&b);
+
+    put_eth(&b, ETHERTYPE_IPV6);
+    put_ipv6(&b, 44, TEST_V6_A, TEST_V6_B, 8 + 16);
+    bb_u8(&b, IPPROTO_NUM_UDP);
+    bb_u8(&b, 0);
+    bb_be16(&b, 3u << 3);           /* offset 24 bytes, last fragment */
+    bb_be32(&b, 0xCAFEF00Du);
+    bb_fill(&b, 0, 16);
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.frag, FRAG_LATER);
+    CHECK_EQ(pi.frag_id, 0xCAFEF00Du);
+    bb_free(&b);
+}
+
+static void test_ipv6_broken_chain_has_no_proto(void)
+{
+    struct bytebuf b;
+    struct packet_info pi;
+
+    /* A routing header that claims more bytes than the payload holds: the
+     * transport protocol is never reached, so ip_proto stays 0 instead of
+     * naming the routing header (43) that failed. */
+    bb_init(&b);
+    put_eth(&b, ETHERTYPE_IPV6);
+    put_ipv6(&b, 43, TEST_V6_A, TEST_V6_B, 8);
+    bb_u8(&b, IPPROTO_NUM_TCP);
+    bb_u8(&b, 3);                   /* 32 bytes, in an 8-byte payload */
+    bb_fill(&b, 0, 6);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_IPV6_EXT);
+    CHECK(pi.has_l3);
+    CHECK_EQ(pi.ip_proto, 0);
+    CHECK(!pi.has_l4);
+    bb_free(&b);
+}
+
 static void test_bad_tcp_doff(void)
 {
     struct bytebuf b;
@@ -593,8 +709,9 @@ static void test_other_l4_protocol(void)
 }
 
 /* Decode every prefix of a valid frame, both as a snapped capture and as a
- * complete (short) frame. Nothing may crash or read out of bounds, and only
- * the full frame may decode cleanly. */
+ * complete (short) frame. Nothing may crash or read out of bounds, only the
+ * full frame may decode cleanly, a snapped prefix is never blamed on the
+ * packet, and a complete short frame is never called truncated. */
 static void check_all_prefixes(const struct bytebuf *b)
 {
     struct packet_info pi;
@@ -609,6 +726,9 @@ static void check_all_prefixes(const struct bytebuf *b)
         if (len == b->len) {
             CHECK_EQ(snapped, DEC_OK);
             CHECK_EQ(whole, DEC_OK);
+        } else {
+            CHECK(!decode_status_is_truncation(whole));
+            CHECK(snapped == DEC_OK || decode_status_is_truncation(snapped));
         }
     }
 }
@@ -648,6 +768,7 @@ static void test_status_strings(void)
     CHECK(!decode_status_is_truncation(DEC_OK));
     CHECK(decode_status_is_truncation(DEC_TRUNC_ETHERNET));
     CHECK(decode_status_is_truncation(DEC_TRUNC_ICMP));
+    CHECK(!decode_status_is_truncation(DEC_BAD_SHORT_FRAME));
     CHECK(!decode_status_is_truncation(DEC_BAD_VLAN_DEPTH));
     CHECK(!decode_status_is_truncation(DEC_BAD_UDP_LEN));
 }
@@ -662,6 +783,7 @@ void run_decode_tests(void)
     RUN_TEST(test_single_vlan);
     RUN_TEST(test_double_vlan);
     RUN_TEST(test_vlan_errors);
+    RUN_TEST(test_complete_short_frame_is_malformed);
     RUN_TEST(test_ipv4_options);
     RUN_TEST(test_ipv4_options_snapped);
     RUN_TEST(test_ipv4_nonfirst_fragment);
@@ -672,6 +794,9 @@ void run_decode_tests(void)
     RUN_TEST(test_ipv6_ext_overrun);
     RUN_TEST(test_bad_ihl);
     RUN_TEST(test_bad_ipv4_total_len);
+    RUN_TEST(test_ipv4_total_len_zero_tso);
+    RUN_TEST(test_fragment_ids);
+    RUN_TEST(test_ipv6_broken_chain_has_no_proto);
     RUN_TEST(test_bad_tcp_doff);
     RUN_TEST(test_ipv6_payload_exceeds_caplen);
     RUN_TEST(test_snaplen_truncation_is_not_malformed);

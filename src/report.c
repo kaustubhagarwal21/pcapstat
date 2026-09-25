@@ -129,7 +129,8 @@ void report_summary(FILE *out, const char *path,
             s->tcp, s->udp, s->icmp, s->icmpv6, s->other_l4);
     fprintf(out, "VLAN:        %" PRIu64 " tagged frames\n", s->vlan_tagged);
     fprintf(out, "Fragments:   %" PRIu64 " first, %" PRIu64
-                 " non-first (not L4-decoded)\n", s->frag_first, s->frag_later);
+                 " non-first (%" PRIu64 " matched to their first fragment's "
+                 "ports)\n", s->frag_first, s->frag_later, s->frag_matched);
     fprintf(out, "Flows:       %zu\n", flow_count);
     fprintf(out, "Problems:    %" PRIu64 " truncated, %" PRIu64
                  " malformed (excluded from flows)\n",

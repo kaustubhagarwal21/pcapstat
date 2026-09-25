@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "hash.h"
+
 #define MIN_CAPACITY 16u
 
 /* Grow when count / capacity would exceed 7/10. Linear probing slows down
@@ -13,23 +15,6 @@
  * probe length. */
 #define LOAD_NUM 7u
 #define LOAD_DEN 10u
-
-/* 64-bit FNV-1a: simple, fast for short keys, and good enough spreading for
- * a table indexed by the low bits. Not collision-resistant against crafted
- * input; see the README's limitations. */
-#define FNV64_OFFSET 0xcbf29ce484222325ull
-#define FNV64_PRIME  0x100000001b3ull
-
-static uint64_t fnv1a(uint64_t h, const uint8_t *p, size_t n)
-{
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        h ^= p[i];
-        h *= FNV64_PRIME;
-    }
-    return h;
-}
 
 /* Hash the key field by field instead of hashing the struct's bytes, so the
  * result never depends on padding bytes, whose values C leaves unspecified. */

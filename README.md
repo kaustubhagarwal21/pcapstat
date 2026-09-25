@@ -29,9 +29,11 @@ code review alone.
   ICMP/ICMPv6 (type, code).
 - Counts every packet it cannot fully decode by reason, and tells truncation
   (the capture stopped early) apart from malformation (a length field is
-  impossible). Nothing it fails to understand stops the run.
+  impossible, or the frame is too short for its own headers). Nothing it
+  fails to understand stops the run.
 - Keeps bidirectional 5-tuple flows in an open-addressing hash table and
-  prints the top N by bytes. `--csv` writes every flow to a CSV file.
+  prints the top N by bytes. Later IP fragments, which carry no ports, are
+  matched to their datagram's flow. `--csv` writes every flow to a CSV file.
 
 ## Build and run
 
@@ -40,7 +42,7 @@ sample and benchmark captures.
 
 ```sh
 make                  # release build: build/pcapstat
-make test             # 61 unit tests + 22 CLI checks
+make test             # 73 unit tests + 24 CLI checks
 make asan             # the same tests under ASan + UBSan
 make fuzz             # 200,000 fuzz iterations under ASan + UBSan
 make bench            # build a 1,000,000-packet capture, then time pcapstat on it
@@ -59,7 +61,8 @@ exit status: 0 ok, 1 usage error, 2 input error
 An input error covers a file that cannot be opened, is not a pcap file,
 turns out to be truncated or corrupt part-way through, or a CSV file that
 cannot be written. For a capture damaged part-way through, the summary for
-the records before the damage is still printed.
+the records before the damage is still printed. Naming the input file as the
+`--csv` output is a usage error, so a slip cannot overwrite the capture.
 
 ## Sample output
 
@@ -87,31 +90,35 @@ Duration:    2.933017 s (136.4 packets/s, 0.593 Mbit/s)
 Network:     IPv4 369 (92.2%), IPv6 27 (6.8%), non-IP 4 (1.0%)
 Transport:   TCP 325, UDP 57, ICMP 9, ICMPv6 5, other 0
 VLAN:        47 tagged frames
-Fragments:   3 first, 6 non-first (not L4-decoded)
-Flows:       29
+Fragments:   3 first, 6 non-first (6 matched to their first fragment's ports)
+Flows:       28
 Problems:    0 truncated, 0 malformed (excluded from flows)
 
-Top 10 of 29 flows by bytes (src = sender of the first packet seen):
-  #  proto   src                 dst                  packets       bytes      duration  tcp flags
-  1  TCP     10.0.0.5:38348      198.51.100.34:443        129      121443       0.579 s  FSPA
-  2  TCP     10.0.0.6:53655      203.0.113.9:443           34       16123       1.095 s  FSPA
-  3  UDP     203.0.113.124:443   10.0.0.2:37158             8        9710       0.014 s  -
-  4  TCP     10.0.0.3:45033      203.0.113.126:443         34        9678       1.595 s  FSPA
-  5  UDP     203.0.113.190:4500  10.0.0.4:52459             8        9596       0.019 s  -
-  6  UDP     198.51.100.8:0      10.0.0.6:0                 6        6315       0.007 s  -
-  7  TCP     10.0.0.2:40834      203.0.113.80:443          16        6264       0.623 s  FSPA
-  8  TCP     10.0.0.3:40596      198.51.100.211:443        14        5533       0.171 s  FSPA
-  9  UDP     198.51.100.8:4500   10.0.0.6:42363             3        4542       0.007 s  -
- 10  TCP     10.0.0.6:60851      203.0.113.57:443          18        4358       0.480 s  FSPA
+Top 10 of 28 flows by bytes (src = sender of the first packet seen):
+  #  proto   src                    dst                     packets       bytes      duration  tcp flags
+  1  TCP     10.0.0.5:38348         198.51.100.34:443           129      121443       0.579 s  FSPA
+  2  TCP     10.0.0.6:53655         203.0.113.9:443              34       16123       1.095 s  FSPA
+  3  UDP     198.51.100.8:4500      10.0.0.6:42363                9       10857       0.007 s  -
+  4  UDP     203.0.113.124:443      10.0.0.2:37158                8        9710       0.014 s  -
+  5  TCP     10.0.0.3:45033         203.0.113.126:443            34        9678       1.595 s  FSPA
+  6  UDP     203.0.113.190:4500     10.0.0.4:52459                8        9596       0.019 s  -
+  7  TCP     10.0.0.2:40834         203.0.113.80:443             16        6264       0.623 s  FSPA
+  8  TCP     10.0.0.3:40596         198.51.100.211:443           14        5533       0.171 s  FSPA
+  9  TCP     10.0.0.6:60851         203.0.113.57:443             18        4358       0.480 s  FSPA
+ 10  TCP     [2001:db8:1::4]:50731  [2001:db8:ff::6d]:443        10        2356       0.256 s  FSPA
 ```
 
 Notes on reading it:
 
 - TCP flags are the union over the whole flow, in bit order F S R P A U E C.
   `FSPA` means the flow saw FIN, SYN, PSH and ACK.
-- Row 6 is the non-first IP fragments of the stream in row 9. They carry no
-  UDP header, so they have no ports. pcapstat does not reassemble fragments,
-  so they form their own port-less flow (see [Limitations](#limitations)).
+- Row 3 is a UDP stream whose datagrams were too big for the MTU, so each
+  was sent as IP fragments. Only a first fragment carries the UDP header;
+  the 6 later ones have no ports of their own. pcapstat matches them to
+  their first fragment by (source, destination, protocol, IP ID) and gives
+  them its ports, so all 9 packets count toward one flow. Without that
+  matching, the stream would be split into a 3-packet flow and a port-less
+  6-packet flow, and neither would rank as high.
 - The CSV file (`--csv flows.csv`) has one row per flow, largest first:
   `src_addr,src_port,dst_addr,dst_port,protocol,ip_version,packets,bytes,first_ts,last_ts,duration_s,tcp_flags`,
   with timestamps as `seconds.nanoseconds`.
@@ -130,10 +137,11 @@ Notes on reading it:
 | `src/pcap_reader.{c,h}` | Global header and record parsing from a file or a memory buffer |
 | `src/decode.{c,h}` | Pure, bounds-checked frame decoder producing a `struct packet_info` |
 | `src/flow.{c,h}` | Bidirectional flow key, open-addressing hash table, top-N selection |
+| `src/frag.{c,h}` | Direct-mapped cache that gives later IP fragments their datagram's ports |
 | `src/stats.{c,h}` | Capture-wide counters, including decode problems by reason |
-| `src/analyze.{c,h}` | The read → decode → count loop, shared by the CLI and the tests |
+| `src/analyze.{c,h}` | The read → decode → count loop, shared by the CLI, the tests and the fuzzer |
 | `src/report.{c,h}`, `src/addr.{c,h}` | Text output, CSV, RFC 5952 IPv6 formatting |
-| `src/bytes.h` | Explicit big/little-endian loads from byte buffers |
+| `src/bytes.h`, `src/hash.h` | Explicit big/little-endian loads from byte buffers; FNV-1a |
 | `src/main.c` | Argument parsing and exit codes |
 
 ### Reading the file
@@ -146,7 +154,10 @@ Notes on reading it:
 - **Every length is checked before it sizes a read.** `caplen` above 262144
   (libpcap's own limit) is rejected before any bytes are read, so a corrupt
   record header cannot cause a huge read or allocation. The record buffer is
-  allocated once.
+  allocated once. An `origlen` smaller than `caplen` is impossible (a frame
+  cannot be shorter on the wire than the bytes saved of it), so it is raised
+  to `caplen`; otherwise the wire-byte totals could come out smaller than
+  the captured-byte totals.
 - **Truncation is reported, not tolerated silently.** Zero bytes at a record
   boundary is a clean end of file. 1–15 bytes of a record header, or fewer
   data bytes than `caplen`, is reported as a truncated file. Errors are
@@ -154,8 +165,10 @@ Notes on reading it:
 - **Overflow-safe arithmetic.** Timestamps are computed in 64 bits:
   `(2^32-1) * 10^9 + (2^32-1) * 1000` still fits. The memory reader compares
   `n > len - pos` rather than computing `pos + n`.
-- **One code path, two sources.** The reader works on a `FILE *` or on a
-  memory buffer. The tests and the fuzzer use memory; the CLI uses files.
+- **One code path, two sources.** The reader works on a `FILE *` (a path,
+  or an already-open stream) or on a memory buffer. The CLI uses files, the
+  tests use both, and the fuzzer reads every mutated file both ways and
+  requires identical results.
 
 ### Bounds-checked decoding
 
@@ -175,19 +188,33 @@ inconsistent (**malformed**). A length field from the packet can only ever
 the buffer. Ethernet padding is dropped the same way: a 46-byte IP packet in
 a 60-byte frame is limited to 46 bytes.
 
+Every header check goes through the same `need()` function, including the
+checks for fixed-size headers (Ethernet, VLAN tag, IPv4, IPv6). For a frame
+captured in full (`caplen == origlen`), `cap == wire` then holds at every
+layer, so such a frame can never be reported as truncated. A complete
+30-byte frame that ends inside its IPv4 header is **malformed** ("frame too
+short for its headers"). The same 30 bytes cut from a 1514-byte frame by a
+snapshot length are **truncated**. A unit test and a fuzzer invariant both
+check this.
+
 Other rules:
 
 - Multi-byte fields are read with byte loads (`load_be16`, `load_be32`), never
   by casting the buffer to a struct pointer. Packet data is unaligned (the IP
   header starts at offset 14), and a cast would also break strict aliasing.
 - IPv4: IHL must be ≥ 5. Options are skipped using IHL, and the total length
-  must be between the header length and the frame length.
+  must be between the header length and the frame length. A total length of
+  0 is what packets captured on a sender using TCP segmentation offload look
+  like (the NIC fills in the lengths later). Like Wireshark, pcapstat then
+  assumes the packet runs to the end of the frame.
 - IPv4 and IPv6 fragments: only the first fragment (offset 0) carries the L4
   header. Later fragments are counted, but their first bytes are not read as
   ports.
 - IPv6: extension headers are walked in a loop capped at 8 headers, and each
   one's length is checked against both `cap` and `wire`. The payload length
-  must fit in the frame.
+  must fit in the frame. If the chain is broken, the transport protocol is
+  unknown: the packet counts as IPv6 and as malformed or truncated, but not
+  under any transport protocol.
 - TCP: the data offset must be ≥ 5 and within the IP payload. UDP: the length
   must be ≥ 8 and, unless the packet is a fragment, within the IP payload.
 - Unknown ethertypes and IP protocols are valid input: they are counted as
@@ -215,6 +242,15 @@ say, for example, "TCP data offset invalid: 3".
   of order) and the OR of all TCP flags seen. Only cleanly decoded packets
   join a flow; truncated and malformed packets appear only in the global
   counters.
+- **Fragments.** Only the first fragment of a datagram carries the TCP/UDP
+  header. All fragments share (IP version, source, destination, protocol,
+  identification), so a first fragment's ports are stored under that key
+  and a later fragment with the same key borrows them. The store is a
+  direct-mapped cache of 4,096 slots (176 KiB): each key has exactly one
+  slot and a new entry overwrites the old one. Memory is fixed no matter how
+  many fragments a capture holds, and nothing needs evicting. A collision,
+  or a later fragment that arrives before its first fragment, leaves that
+  fragment port-less, as it would be without the cache.
 - **Top-N.** A size-N min-heap keyed on rank: a flow only has to beat the
   heap's root to get in, so selection costs O(F log N) for F flows. The N
   winners are then sorted. Ties are broken by packets, then start time, then
@@ -222,7 +258,7 @@ say, for example, "TCP data offset invalid: 3".
 
 ## Testing
 
-`make test` runs 61 unit tests (41,844 individual checks) and 22 CLI checks.
+`make test` runs 73 unit tests (42,257 individual checks) and 24 CLI checks.
 The tests use a small assert framework in `tests/test.h` with no external
 dependencies. `tests/builder.c` builds frames and pcap files byte by byte, so
 each test states exactly what the decoder sees. The tests cover:
@@ -230,31 +266,39 @@ each test states exactly what the decoder sees. The tests cover:
 - **pcap reader:** all four magic/endianness combinations, bad magic, pcapng
   rejection, bad version and link type, every truncated global-header length
   0–23, a truncated record header and record body, oversized `caplen`
-  (262145 and 0xFFFFFFFF), exactly 262144 bytes, empty captures, and file
-  I/O.
+  (262145 and 0xFFFFFFFF), exactly 262144 bytes, `origlen < caplen`, empty
+  captures, and file and stream I/O.
 - **Decoder:** IPv4/IPv6 with TCP (ports, flags), UDP, ICMP and ICMPv6.
   Single, double and triple VLAN tags. IPv4 options at every IHL from 6 to
   15. First and non-first fragments for IPv4, and IPv6 with hop-by-hop plus
-  fragment headers. Destination-options plus routing headers, the extension
-  chain limit, and extension headers that overrun. Malformed input: IHL < 5,
-  bad total length, TCP data offset < 5 or too large, UDP length, and an IPv6
-  payload length larger than the frame. Snapshot-length truncation, which is
-  not an error, Ethernet padding, and non-IP frames.
+  fragment headers, including the fragment IDs. Destination-options plus
+  routing headers, the extension chain limit, and extension headers that
+  overrun. Malformed input: IHL < 5, bad total length, TCP data offset < 5
+  or too large, UDP length, an IPv6 payload length larger than the frame,
+  and complete frames that end inside the Ethernet, VLAN, IPv4 or IPv6
+  header. Snapshot-length truncation, which is not an error, IPv4 total
+  length 0 (TSO), Ethernet padding, and non-IP frames.
 - **Prefix sweep:** every prefix of several frames is decoded from a heap
-  buffer of exactly that length, both as a snapped capture and as a complete
-  frame.
+  buffer of exactly that length, both as a snapped capture (which must come
+  out OK or truncated) and as a complete frame (which must never come out
+  truncated).
 - **Flows:** normalisation, bidirectional merging, distinct 5-tuples,
   out-of-order timestamps, growth to 20,000 flows (with the load-factor and
   power-of-two invariants checked, and every flow found again), iteration,
   top-N ordering and tie-breaks, and top-N checked against a full sort of
-  3,000 random flows.
-- **Output:** exact CSV text, RFC 5952 IPv6 formatting cases, TCP flag
-  strings, and an end-to-end pipeline over a mixed capture with exact
-  counters.
+  3,000 random flows. The fragment cache: matching, a later fragment before
+  its first, different IDs and peers, and 1,000 datagrams in flight with no
+  wrong match.
+- **Output:** exact CSV text, RFC 5952 IPv6 formatting cases (including
+  IPv4-mapped addresses), TCP flag strings, and end-to-end pipelines with
+  exact counters: a mixed capture, fragments joining their flow, complete
+  short frames counted as malformed, and a broken IPv6 chain counted under
+  no transport protocol.
 - **CLI** (`tests/cli_test.sh`): exit codes for `--help`, usage errors, a
   missing file, a non-pcap file, a truncated capture (partial stats plus exit
-  2) and an unwritable CSV path. It also checks the CSV header and that the
-  CSV has one row per flow.
+  2), an unwritable CSV path, and `--csv` naming the input file (refused,
+  input untouched). It also checks the CSV header and that the CSV has one
+  row per flow.
 
 **Sanitizers.** `make asan` builds the same tests and the CLI with
 `-fsanitize=address,undefined -fno-sanitize-recover=all`, so any UB report
@@ -263,43 +307,72 @@ so leaks fail too.
 
 **Fuzzing.** `fuzz/fuzz_decode.c` is a deterministic mutation fuzzer using a
 seeded xorshift64 PRNG, so a given iteration count and seed always replay the
-same inputs. Each iteration does the following:
+same inputs. Each random draw is its own statement: C leaves the evaluation
+order of function arguments unspecified, so `f(rng(), rng())` would replay
+differently under gcc and clang. With that rule, both compilers produce the
+same fuzz report, number for number. Each iteration does the following:
 
-- It takes one of 12 valid seed frames and applies 1–4 mutations: bit flips,
+- It takes one of 13 valid seed frames and applies 1–4 mutations: bit flips,
   random bytes, boundary values written at header offsets (0, 5, 20, 0xFFFF,
   ethertypes, ...), nibble rewrites (IP version, IHL, TCP data offset),
   truncation and extension.
 - It decodes the result from a heap buffer of *exactly* the mutated length,
-  so ASan reports a read even one byte past the end.
-- It checks invariants on every result, for example that no L4 fields are
-  set without a valid L3 header, and that no ports are read in non-first
-  fragments.
+  so ASan reports a read even one byte past the end, and then runs it
+  through the same accounting as the tool (fragment cache, counters, flow
+  table).
+- It checks invariants on every result. For example: no L4 fields without a
+  valid L3 header, no ports read in non-first fragments, and a frame whose
+  captured length equals its wire length never classified as truncated.
+- It formats one random IPv6 address (half its groups zero, sometimes
+  IPv4-mapped) and compares the text with the C library's `inet_ntop()`.
 
 Every fourth iteration it also builds a small pcap file from mutated frames,
-corrupts record lengths (`caplen` and `origlen`) and random file bytes, cuts
-the file at a random point, and runs it through the reader, decoder, stats
-and flow table.
+corrupts record lengths (`caplen` and `origlen`) and random file bytes, and
+cuts the file at a random point. It then reads the file twice in lockstep:
+from memory, and through `fread()` from a `tmpfile()`. Both readers must
+return the same records and the same final status. At the end, the summary,
+top-N table and CSV are written for the whole fuzzed flow table, and the CSV
+must have exactly one row per flow.
 
-`make fuzz` (200,000 iterations, seed 1) reached all 19 decoder outcomes and
+`make fuzz` (200,000 iterations, seed 1) reached all 20 decoder outcomes and
 7 of the reader's format-error paths. pcapng detection is not reached by
-random mutation; a unit test covers it instead.
+random mutation; a unit test covers it instead. Excerpt:
 
 ```text
 decoder: 200000 mutated frames
-  ok                                     139861
-  truncated Ethernet header              15089
-  ...                                    (all 18 problem reasons reached)
-  UDP length invalid                     2122
-reader: 50000 mutated pcap files, 70938 records decoded
-  end of file                            28740
-  corrupt record: captured length exceeds 262144 bytes 5148
+  ok                                     139927
+  truncated Ethernet header              7558
+  ...                                    (all 19 problem reasons reached)
+  frame too short for its headers        17585
   ...
+  UDP length invalid                     2070
+reader: 50000 mutated pcap files (each read from memory and through stdio), 70429 records decoded
+  end of file                            28822
+  ...
+  corrupt record: captured length exceeds 262144 bytes 5215
+addresses: 200000 IPv6 addresses checked against inet_ntop
+flow table: 30815 flows, 14550 later fragments matched
+reports: summary, top 100 table and 30815-row CSV written
 result: no crashes, no sanitizer reports, all invariants held
 ```
 
-To check that the fuzzer can find real bugs, the `hlen > cap` check in
-`decode_ipv4` was deleted from a scratch copy. `make fuzz` then failed with
-an ASan `heap-buffer-overflow` report in `decode_l4`.
+A longer run, `make fuzz FUZZ_ITERS=1000000`, also passes: 1,000,000
+mutated frames, 250,000 mutated files (353,901 records) and 1,000,000
+addresses, with a byte-identical report from gcc 13.3.0 and clang 17.0.6.
+
+Two checks that the fuzzer finds real bugs, each on a scratch copy:
+
+- With the `hlen > cap` check in `decode_ipv4` deleted, `make fuzz` failed
+  with an ASan `heap-buffer-overflow` report in `decode_l4`.
+- With the IPv4 fixed-header check changed back to the old
+  `if (cap < 20) return DEC_TRUNC_IPV4`, it failed at iteration 23:
+  "complete frame classified as truncated".
+
+**Compilers.** Locally (WSL2, Ubuntu 24.04), `make`, `make test`,
+`make asan` and `make fuzz FUZZ_ITERS=1000000` all pass with gcc 13.3.0 and
+with clang 17.0.6 (`make CC=clang`). CI runs `make`, `make test`,
+`make asan` and `make fuzz FUZZ_ITERS=50000` with both compilers on
+`ubuntu-latest`.
 
 ## Benchmarks
 
@@ -328,9 +401,16 @@ about 0.5 s of that was user CPU; the rest was waiting on I/O.
   (`editcap -F pcap in.pcapng out.pcap`).
 - Ethernet link type only (`DLT_EN10MB`). Linux cooked capture, raw IP and
   802.11 are rejected with a clear error.
-- No IP fragment reassembly and no TCP stream reassembly. Non-first
-  fragments are counted, and form a port-less flow for their address pair.
+- No IP fragment reassembly and no TCP stream reassembly. A non-first
+  fragment joins its datagram's flow only if the first fragment was seen
+  earlier and still holds its slot in the 4,096-slot cache. Otherwise it
+  forms a port-less flow for its address pair.
 - Checksums are not verified.
+- An IPv4 total length of 0 is read as TCP segmentation offload ("to the end
+  of the frame"), not as an error, so a corrupt 0 in a normal packet is not
+  flagged.
+- The `--csv` guard compares file names, so `--csv ./cap.pcap cap.pcap` is
+  not caught. Catching every spelling would need POSIX `stat()`.
 - IPv6 jumbograms are not supported. AH/ESP and other headers are not walked
   and count as "other" protocols.
 - At most two VLAN tags. A third is reported as a decode problem.

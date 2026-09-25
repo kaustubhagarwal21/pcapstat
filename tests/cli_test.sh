@@ -88,8 +88,21 @@ fi
 
 expect_exit 2 "unwritable CSV path" -- "$BIN" --csv "$TMP/no-such-dir/x.csv" "$SAMPLE"
 
+# --csv naming the input file must be refused before anything is written.
+# Run on a copy so a regression cannot damage the committed sample.
+cp "$SAMPLE" "$TMP/cli_copy.pcap"
+expect_exit 1 "--csv same as the input file" -- \
+    "$BIN" --csv "$TMP/cli_copy.pcap" "$TMP/cli_copy.pcap"
+if cmp -s "$SAMPLE" "$TMP/cli_copy.pcap"; then
+    pass=$((pass + 1))
+    echo "ok    cli: input file left untouched"
+else
+    fail=$((fail + 1))
+    echo "FAIL  cli: input file was modified"
+fi
+
 rm -f "$TMP"/cli_out.txt "$TMP"/cli_err.txt "$TMP"/cli_not_pcap.txt \
-    "$TMP"/cli_truncated.pcap "$TMP"/cli_flows.csv
+    "$TMP"/cli_truncated.pcap "$TMP"/cli_flows.csv "$TMP"/cli_copy.pcap
 echo
 echo "$pass cli checks passed, $fail failed"
 [ "$fail" -eq 0 ]

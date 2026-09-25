@@ -207,6 +207,7 @@ static void test_pipeline_counts(void)
     CHECK_EQ(s->icmpv6, 0);
     CHECK_EQ(s->vlan_tagged, 1);
     CHECK_EQ(s->frag_later, 1);
+    CHECK_EQ(s->frag_matched, 0);  /* its first fragment is not in the file */
     CHECK_EQ(s->truncated, 1);
     CHECK_EQ(s->malformed, 1);
     CHECK_EQ(s->by_status[DEC_TRUNC_TCP], 1);
@@ -238,6 +239,145 @@ static void test_pipeline_truncated_file(void)
     CHECK_EQ(an.stats.packets, 10); /* everything before the damage */
     analysis_free(&an);
     pcap_close(&r);
+    bb_free(&cap);
+}
+
+/* Run a capture through the whole pipeline. */
+static void analyze_capture(const struct bytebuf *cap, struct analysis *an)
+{
+    struct pcap_reader r;
+
+    CHECK_EQ(pcap_open_mem(&r, cap->data, cap->len), PCAP_OK);
+    CHECK_EQ(analysis_init(an), 0);
+    CHECK_EQ(analysis_run(an, &r), PCAP_EOF);
+    pcap_close(&r);
+}
+
+/* Regression for the review repro: three complete frames that end inside a
+ * fixed-size header (IPv4, IPv6, VLAN) are malformed, and the same bytes
+ * from 1514-byte frames cut by a snapshot length are truncated. */
+static void test_short_complete_frames_counted_malformed(void)
+{
+    struct bytebuf cap, v4, v6, vl;
+    struct analysis an;
+    const struct stats *s = &an.stats;
+
+    bb_init(&cap);
+    bb_init(&v4);
+    bb_init(&v6);
+    bb_init(&vl);
+    put_eth(&v4, ETHERTYPE_IPV4);
+    bb_be32(&v4, 0x45000028u);
+    bb_fill(&v4, 0, 6);                     /* 10 of 20 IPv4 header bytes */
+    put_eth(&v6, ETHERTYPE_IPV6);
+    bb_u8(&v6, 0x60);
+    bb_fill(&v6, 0, 29);                    /* 30 of 40 IPv6 header bytes */
+    put_eth(&vl, ETHERTYPE_VLAN);
+    bb_be16(&vl, 5);                        /* 2 of 4 VLAN tag bytes */
+
+    pcap_put_global(&cap, 0, 0, 65535, 1);
+    pcap_put_record(&cap, 0, 1, 0, v4.data, (uint32_t)v4.len, (uint32_t)v4.len);
+    pcap_put_record(&cap, 0, 1, 0, v6.data, (uint32_t)v6.len, (uint32_t)v6.len);
+    pcap_put_record(&cap, 0, 1, 0, vl.data, (uint32_t)vl.len, (uint32_t)vl.len);
+    pcap_put_record(&cap, 0, 1, 0, v4.data, (uint32_t)v4.len, 1514);
+    pcap_put_record(&cap, 0, 1, 0, v6.data, (uint32_t)v6.len, 1514);
+    pcap_put_record(&cap, 0, 1, 0, vl.data, (uint32_t)vl.len, 1514);
+
+    analyze_capture(&cap, &an);
+    CHECK_EQ(s->packets, 6);
+    CHECK_EQ(s->truncated, 3);
+    CHECK_EQ(s->malformed, 3);
+    CHECK_EQ(s->by_status[DEC_BAD_SHORT_FRAME], 3);
+    CHECK_EQ(s->by_status[DEC_TRUNC_IPV4], 1);
+    CHECK_EQ(s->by_status[DEC_TRUNC_IPV6], 1);
+    CHECK_EQ(s->by_status[DEC_TRUNC_VLAN], 1);
+    CHECK_EQ(an.flows.count, 0);
+    analysis_free(&an);
+    bb_free(&cap);
+    bb_free(&v4);
+    bb_free(&v6);
+    bb_free(&vl);
+}
+
+/* Later fragments join their datagram's flow when the first fragment has
+ * been seen, instead of forming a port-less flow of their own. */
+static void test_fragment_attribution(void)
+{
+    struct bytebuf cap, fr;
+    struct analysis an;
+    struct packet_info key_pkt;
+    struct flow_key key;
+    const struct flow *f;
+    int rev;
+
+    bb_init(&cap);
+    bb_init(&fr);
+    pcap_put_global(&cap, 0, 0, 65535, 1);
+
+    /* Datagram 0x1234: first fragment (MF, offset 0) with the UDP header,
+     * then two later fragments. put_ipv4 always writes ID 0x1234. */
+    put_eth(&fr, ETHERTYPE_IPV4);
+    put_ipv4(&fr, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 1480, 0, 0x2000);
+    put_udp(&fr, 4444, 5555, 3000);
+    bb_fill(&fr, 0, 1472);
+    pcap_put_record(&cap, 0, 1, 0, fr.data, (uint32_t)fr.len, (uint32_t)fr.len);
+    bb_free(&fr);
+    put_eth(&fr, ETHERTYPE_IPV4);
+    put_ipv4(&fr, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 1480, 0, 0x2000 | 185);
+    bb_fill(&fr, 0, 1480);
+    pcap_put_record(&cap, 0, 2, 0, fr.data, (uint32_t)fr.len, (uint32_t)fr.len);
+    bb_free(&fr);
+    put_eth(&fr, ETHERTYPE_IPV4);
+    put_ipv4(&fr, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 48, 0, 370);
+    bb_fill(&fr, 0, 48);
+    pcap_put_record(&cap, 0, 3, 0, fr.data, (uint32_t)fr.len, (uint32_t)fr.len);
+
+    /* A later fragment of another datagram (ID 0x9999), first one unseen. */
+    fr.data[14 + 4] = 0x99;
+    fr.data[14 + 5] = 0x99;
+    pcap_put_record(&cap, 0, 4, 0, fr.data, (uint32_t)fr.len, (uint32_t)fr.len);
+    bb_free(&fr);
+
+    analyze_capture(&cap, &an);
+    CHECK_EQ(an.stats.frag_first, 1);
+    CHECK_EQ(an.stats.frag_later, 3);
+    CHECK_EQ(an.stats.frag_matched, 2);
+    CHECK_EQ(an.flows.count, 2);   /* the UDP flow, and the orphan */
+
+    key_pkt = pkt(4, IPPROTO_NUM_UDP, TEST_V4_A, 4444, TEST_V4_B, 5555, 0);
+    CHECK(flow_key_from_packet(&key_pkt, &key, &rev));
+    f = flow_table_find(&an.flows, &key);
+    CHECK(f != NULL && f->packets == 3);
+    CHECK(f != NULL && f->bytes == (14 + 20 + 1480) * 2 + (14 + 20 + 48));
+    analysis_free(&an);
+    bb_free(&cap);
+}
+
+/* An IPv6 packet with a broken extension chain counts as IPv6 and as
+ * malformed, but not under any transport protocol. */
+static void test_broken_ipv6_chain_stats(void)
+{
+    struct bytebuf cap, fr;
+    struct analysis an;
+    const struct stats *s = &an.stats;
+
+    bb_init(&cap);
+    bb_init(&fr);
+    put_eth(&fr, ETHERTYPE_IPV6);
+    put_ipv6(&fr, 0, TEST_V6_A, TEST_V6_B, 8);
+    bb_u8(&fr, IPPROTO_NUM_UDP);
+    bb_u8(&fr, 4);                          /* 40 bytes in an 8-byte payload */
+    bb_fill(&fr, 0, 6);
+    pcap_put_global(&cap, 0, 0, 65535, 1);
+    pcap_put_record(&cap, 0, 1, 0, fr.data, (uint32_t)fr.len, (uint32_t)fr.len);
+
+    analyze_capture(&cap, &an);
+    CHECK_EQ(s->ipv6, 1);
+    CHECK_EQ(s->malformed, 1);
+    CHECK_EQ(s->by_status[DEC_BAD_IPV6_EXT], 1);
+    CHECK_EQ(s->tcp + s->udp + s->icmp + s->icmpv6 + s->other_l4, 0);
+    analysis_free(&an);
+    bb_free(&fr);
     bb_free(&cap);
 }
 
@@ -291,5 +431,8 @@ void run_report_tests(void)
     RUN_TEST(test_csv_empty);
     RUN_TEST(test_pipeline_counts);
     RUN_TEST(test_pipeline_truncated_file);
+    RUN_TEST(test_short_complete_frames_counted_malformed);
+    RUN_TEST(test_fragment_attribution);
+    RUN_TEST(test_broken_ipv6_chain_stats);
     RUN_TEST(test_summary_and_table);
 }

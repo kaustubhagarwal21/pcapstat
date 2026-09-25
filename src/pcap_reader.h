@@ -61,7 +61,7 @@ struct pcap_file_info {
 struct pcap_record {
     uint64_t ts_ns;          /* capture time, nanoseconds since the Unix epoch */
     uint32_t caplen;         /* bytes present in data */
-    uint32_t wirelen;        /* original length of the frame on the wire */
+    uint32_t wirelen;        /* original length on the wire; >= caplen */
     const uint8_t *data;
 };
 
@@ -82,7 +82,8 @@ struct pcap_reader {
 enum pcap_status pcap_parse_global_header(const uint8_t *hdr, size_t len,
                                           struct pcap_file_info *info);
 
-/* Parse and validate a 16-byte record header (everything except `data`). */
+/* Parse and validate a 16-byte record header (everything except `data`).
+ * An origlen smaller than caplen is raised to caplen. */
 enum pcap_status pcap_parse_record_header(const struct pcap_file_info *info,
                                           const uint8_t *hdr,
                                           struct pcap_record *rec);
@@ -90,6 +91,11 @@ enum pcap_status pcap_parse_record_header(const struct pcap_file_info *info,
 /* Open a capture file and validate its global header. On failure the reader
  * holds no resources, but calling pcap_close() is still safe. */
 enum pcap_status pcap_open_file(struct pcap_reader *r, const char *path);
+
+/* Read a capture from a stream that is already open for reading, such as
+ * one from tmpfile(). The reader takes ownership: pcap_close() closes the
+ * stream, and so does a failed open. */
+enum pcap_status pcap_open_stream(struct pcap_reader *r, FILE *fp);
 
 /* Read a capture that is already in memory. `data` must outlive the reader.
  * Records are returned in place, without copying. */

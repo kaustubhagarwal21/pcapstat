@@ -20,7 +20,8 @@ struct stats {
     uint64_t non_ip;           /* valid Ethernet frames carrying something else */
     uint64_t vlan_tagged;      /* frames with at least one VLAN tag */
 
-    uint64_t tcp;              /* by IP protocol, for packets with valid IP */
+    uint64_t tcp;              /* by IP protocol, for packets with valid IP
+                                  whose transport protocol is known */
     uint64_t udp;
     uint64_t icmp;
     uint64_t icmpv6;
@@ -28,6 +29,8 @@ struct stats {
 
     uint64_t frag_first;       /* first fragments (offset 0, more to come) */
     uint64_t frag_later;       /* non-first fragments (not L4-decoded) */
+    uint64_t frag_matched;     /* non-first fragments given the ports of their
+                                  datagram's first fragment (see frag.h) */
 
     uint64_t truncated;        /* sum of the truncation reasons below */
     uint64_t malformed;        /* sum of the malformation reasons below */

@@ -1,6 +1,6 @@
 /*
- * fuzz_decode.c - deterministic mutation fuzzer for the frame decoder and
- * the pcap record reader.
+ * fuzz_decode.c - deterministic mutation fuzzer for the frame decoder, the
+ * pcap reader and the output code.
  *
  *   fuzz_decode [ITERATIONS [SEED]]      (defaults: 200000, 1)
  *
@@ -8,24 +8,36 @@
  * frame, applies a few random mutations (bit flips, random bytes, "length
  * field" values such as 0, 5, 0xFFFF, truncation, extension) and decodes it
  * from a heap buffer of exactly the mutated length, so AddressSanitizer
- * catches a read even one byte past the end. Every fourth iteration also
- * builds a small pcap file from mutated frames, corrupts its record headers
- * (caplen in particular) and file bytes, and runs it through the reader and
- * the full decode/stats/flow pipeline.
+ * catches a read even one byte past the end. The result goes through the
+ * same accounting as the real tool (fragment cache, counters, flow table).
+ *
+ * Every fourth iteration also builds a small pcap file from mutated frames,
+ * corrupts its record headers (caplen in particular) and file bytes, and
+ * reads it twice in lockstep: from memory, and through stdio from a
+ * tmpfile(). Both must return the same records and the same final status.
+ *
+ * Each iteration also formats one random IPv6 address and compares it with
+ * the C library's inet_ntop() (POSIX, used here only as a reference). At
+ * the end, the summary, top-N table and CSV are written for the fuzzed
+ * flow table.
  *
  * The same ITERATIONS and SEED always replay the same inputs, so any
  * failure is reproducible. On a crash, sanitizer report or broken invariant
  * the process exits non-zero.
  */
+#define _POSIX_C_SOURCE 200112L /* inet_ntop */
+
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "addr.h"
+#include "analyze.h"
 #include "builder.h"
 #include "decode.h"
-#include "flow.h"
 #include "pcap_reader.h"
-#include "stats.h"
+#include "report.h"
 
 #define MAX_FRAME 2048
 #define MAX_SEEDS 16
@@ -70,6 +82,28 @@ static const uint32_t interesting32[] = {
 
 #define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
 
+/*
+ * Every random draw below is a separate statement. C leaves the order in
+ * which function arguments, and the operands of most operators, are
+ * evaluated unspecified, so something like `buf[rng_below(n)] ^= 1u <<
+ * rng_below(8)` or `f(rng(), rng())` draws the same numbers in a different
+ * order under gcc and clang, and the same seed would replay different
+ * inputs.
+ */
+
+/* Flip one random bit of buf[0..len). */
+static void flip_random_bit(uint8_t *buf, size_t len)
+{
+    size_t at;
+    unsigned bit;
+
+    if (len == 0)
+        return;
+    at = rng_below(len);
+    bit = (unsigned)rng_below(8);
+    buf[at] ^= (uint8_t)(1u << bit);
+}
+
 static void mutate(uint8_t *buf, size_t *len, size_t max)
 {
     unsigned rounds = 1 + (unsigned)rng_below(4);
@@ -77,12 +111,14 @@ static void mutate(uint8_t *buf, size_t *len, size_t max)
     while (rounds--) {
         switch (rng_below(6)) {
         case 0: /* flip one bit */
-            if (*len > 0)
-                buf[rng_below(*len)] ^= (uint8_t)(1u << rng_below(8));
+            flip_random_bit(buf, *len);
             break;
         case 1: /* overwrite one byte */
-            if (*len > 0)
-                buf[rng_below(*len)] = (uint8_t)rng();
+            if (*len > 0) {
+                size_t at = rng_below(*len);
+
+                buf[at] = (uint8_t)rng();
+            }
             break;
         case 2: /* a boundary value in the first 96 bytes, where every
                  * length field of every header we decode lives */
@@ -128,9 +164,11 @@ static void fail(const char *what, unsigned long long iter)
     exit(1);
 }
 
-/* Properties that must hold for any input whatsoever. */
+/* Properties that must hold for any input whatsoever. `complete` is set
+ * when the frame was captured in full (caplen == wire length). */
 static void check_invariants(const struct packet_info *pi,
-                             enum decode_status st, unsigned long long iter)
+                             enum decode_status st, int complete,
+                             unsigned long long iter)
 {
     if (st != pi->status)
         fail("return value != pi->status", iter);
@@ -148,6 +186,10 @@ static void check_invariants(const struct packet_info *pi,
         fail("L4 decoded in a non-first fragment", iter);
     if (st == DEC_OK && pi->has_l2 == 0)
         fail("DEC_OK without L2", iter);
+    /* A frame that was not cut by the capture cannot be "truncated": if it
+     * is too short for its headers, the frame itself is malformed. */
+    if (complete && decode_status_is_truncation(st))
+        fail("complete frame classified as truncated", iter);
 }
 
 /* Decode from an exact-size heap copy so ASan sees any over-read. */
@@ -229,6 +271,12 @@ static size_t build_seeds(struct bytebuf *seeds)
     put_udp(b, 546, 547, 4);
     bb_fill(b, 0, 4);
 
+    b = &seeds[n++];                     /* IPv4 first fragment (MF set) */
+    put_eth(b, ETHERTYPE_IPV4);
+    put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 24, 0, 0x2000);
+    put_udp(b, 4500, 4500, 200);
+    bb_fill(b, 0x33, 16);
+
     b = &seeds[n++];                     /* IPv4 non-first fragment */
     put_eth(b, ETHERTYPE_IPV4);
     put_ipv4(b, IPPROTO_NUM_UDP, TEST_V4_A, TEST_V4_B, 24, 0, 185);
@@ -246,12 +294,30 @@ struct totals {
     unsigned long long files;
     unsigned long long file_records;
     unsigned long long file_outcome[PCAP_ERR_BAD_CAPLEN + 1];
+    unsigned long long stream_files;
+    unsigned long long addrs;
 };
 
-/* Build a small pcap file from mutated frames, corrupt it, and read it. */
+/* Decode one record, check it, and account it like the real tool does. */
+static void process_record(const struct pcap_record *rec, struct analysis *an,
+                           unsigned long long iter)
+{
+    struct packet_info pi;
+    enum decode_status ds;
+
+    if (rec->wirelen < rec->caplen)
+        fail("record wire length below captured length", iter);
+    ds = decode_exact(rec->data, rec->caplen, rec->wirelen, &pi);
+    check_invariants(&pi, ds, rec->wirelen == rec->caplen, iter);
+    if (analysis_account(an, &pi, rec->caplen, rec->wirelen, rec->ts_ns) != 0)
+        fail("flow table out of memory", iter);
+}
+
+/* Build a small pcap file from mutated frames, corrupt it, and read it from
+ * memory and, in lockstep, through stdio. */
 static void fuzz_reader(const struct bytebuf *seeds, size_t nseeds,
-                        struct stats *st, struct flow_table *flows,
-                        struct totals *tot, unsigned long long iter)
+                        struct analysis *an, struct totals *tot,
+                        unsigned long long iter)
 {
     struct bytebuf file;
     size_t rec_hdr_at[MAX_RECORDS];
@@ -259,29 +325,32 @@ static void fuzz_reader(const struct bytebuf *seeds, size_t nseeds,
     int be = (int)(rng() & 1), nsec = (int)(rng() & 1);
     uint8_t frame[MAX_FRAME + 64];
     uint8_t *exact;
-    struct pcap_reader r;
-    struct pcap_record rec;
-    enum pcap_status ps;
+    struct pcap_reader mr, fr;
+    struct pcap_record mrec, frec;
+    enum pcap_status ms, fs;
+    FILE *tmp;
 
     bb_init(&file);
     pcap_put_global(&file, be, nsec, 65535, 1);
     for (k = 0; k < nrec; k++) {
         const struct bytebuf *s = &seeds[rng_below(nseeds)];
         size_t len = s->len;
-        uint32_t wire;
+        uint32_t wire, sec, frac;
 
         memcpy(frame, s->data, len);
         if (rng() & 1)
             mutate(frame, &len, sizeof frame);
         wire = (uint32_t)len + ((rng() & 3) == 0 ? (uint32_t)rng_below(1500) : 0);
+        sec = (uint32_t)rng();
+        frac = (uint32_t)rng();
         rec_hdr_at[k] = file.len;
-        pcap_put_record(&file, be, (uint32_t)rng(), (uint32_t)rng(), frame,
-                        (uint32_t)len, wire);
+        pcap_put_record(&file, be, sec, frac, frame, (uint32_t)len, wire);
     }
 
     /* Corrupt a record length field (caplen or origlen), in file order. */
     if (nrec > 0 && (rng() & 1)) {
-        size_t at = rec_hdr_at[rng_below(nrec)] + 8 + 4 * rng_below(2);
+        size_t rec_no = rng_below(nrec);
+        size_t at = rec_hdr_at[rec_no] + 8 + 4 * rng_below(2);
         uint32_t v = interesting32[rng_below(COUNT_OF(interesting32))];
 
         file.data[at + 0] = (uint8_t)(be ? v >> 24 : v);
@@ -290,8 +359,8 @@ static void fuzz_reader(const struct bytebuf *seeds, size_t nseeds,
         file.data[at + 3] = (uint8_t)(be ? v : v >> 24);
     }
     /* Random damage anywhere, including the global header. */
-    if ((rng() & 3) == 0 && file.len > 0)
-        file.data[rng_below(file.len)] ^= (uint8_t)(1u << rng_below(8));
+    if ((rng() & 3) == 0)
+        flip_random_bit(file.data, file.len);
     /* Cut the file at a random point. */
     if ((rng() & 3) == 0)
         file.len = rng_below(file.len + 1);
@@ -302,33 +371,137 @@ static void fuzz_reader(const struct bytebuf *seeds, size_t nseeds,
     if (file.len > 0)
         memcpy(exact, file.data, file.len);
 
+    /* The same bytes as a real file, read through fread(). */
+    tmp = tmpfile();
+    if (tmp == NULL || fwrite(exact, 1, file.len, tmp) != file.len ||
+        fflush(tmp) != 0) {
+        fprintf(stderr, "fuzz_decode: cannot write temporary file\n");
+        exit(1);
+    }
+    rewind(tmp);
+
     tot->files++;
-    ps = pcap_open_mem(&r, exact, file.len);
-    if (ps == PCAP_OK) {
-        while ((ps = pcap_next(&r, &rec)) == PCAP_OK) {
-            struct packet_info pi;
-            enum decode_status ds;
+    ms = pcap_open_mem(&mr, exact, file.len);
+    fs = pcap_open_stream(&fr, tmp); /* fr now owns tmp */
+    if (ms != fs)
+        fail("memory and stream readers disagree on the global header", iter);
+    if (ms == PCAP_OK) {
+        for (;;) {
+            ms = pcap_next(&mr, &mrec);
+            fs = pcap_next(&fr, &frec);
+            if (ms != fs)
+                fail("memory and stream readers disagree on a record", iter);
+            if (ms != PCAP_OK)
+                break;
+            if (mrec.caplen != frec.caplen || mrec.wirelen != frec.wirelen ||
+                mrec.ts_ns != frec.ts_ns ||
+                memcmp(mrec.data, frec.data, mrec.caplen) != 0)
+                fail("memory and stream readers returned different records",
+                     iter);
 
             /* The record must lie entirely inside the input buffer (memory
              * input returns records in place). caplen is checked first so
              * that file.len - caplen cannot wrap. */
-            if (rec.caplen > PCAP_MAX_CAPLEN || rec.caplen > file.len ||
-                (size_t)(rec.data - exact) > file.len - rec.caplen)
+            if (mrec.caplen > PCAP_MAX_CAPLEN || mrec.caplen > file.len ||
+                (size_t)(mrec.data - exact) > file.len - mrec.caplen)
                 fail("record outside the input buffer", iter);
-            ds = decode_exact(rec.data, rec.caplen, rec.wirelen, &pi);
-            check_invariants(&pi, ds, iter);
-            stats_add(st, &pi, rec.caplen, rec.wirelen, rec.ts_ns);
-            if (ds == DEC_OK &&
-                flow_table_add_packet(flows, &pi, rec.wirelen, rec.ts_ns) != 0)
-                fail("flow table out of memory", iter);
+            process_record(&mrec, an, iter);
             tot->file_records++;
         }
     }
-    if ((unsigned)ps <= PCAP_ERR_BAD_CAPLEN)
-        tot->file_outcome[ps]++;
-    pcap_close(&r);
+    if (mr.records != fr.records)
+        fail("memory and stream readers returned different counts", iter);
+    tot->stream_files++;
+    if ((unsigned)ms <= PCAP_ERR_BAD_CAPLEN)
+        tot->file_outcome[ms]++;
+    pcap_close(&mr);
+    pcap_close(&fr);
     free(exact);
     bb_free(&file);
+}
+
+/* Format a random IPv6 address and compare with inet_ntop(). Half the
+ * groups are zero so that "::" compression is exercised hard. */
+static void fuzz_addr(struct totals *tot, unsigned long long iter)
+{
+    uint8_t a[16];
+    char mine[ADDR_STR_LEN], ref[INET6_ADDRSTRLEN];
+    int g, compat;
+
+    for (g = 0; g < 8; g++) {
+        unsigned v;
+
+        switch (rng_below(4)) {
+        case 0:
+        case 1:  v = 0; break;
+        case 2:  v = (unsigned)rng_below(16); break;
+        default: v = (unsigned)(rng() & 0xFFFF); break;
+        }
+        a[2 * g] = (uint8_t)(v >> 8);
+        a[2 * g + 1] = (uint8_t)v;
+    }
+    if (rng_below(16) == 0) {           /* IPv4-mapped, ::ffff:a.b.c.d */
+        memset(a, 0, 10);
+        a[10] = a[11] = 0xff;
+    }
+    addr_format(6, a, mine, sizeof mine);
+    if (inet_ntop(AF_INET6, a, ref, sizeof ref) == NULL)
+        fail("inet_ntop failed", iter);
+
+    /* glibc also prints the deprecated IPv4-compatible form (96 zero bits,
+     * then a non-zero group) as ::a.b.c.d. RFC 5952 does not ask for that,
+     * and pcapstat prints it in hex, so those addresses are skipped. */
+    compat = a[12] != 0 || a[13] != 0;
+    for (g = 0; g < 12 && compat; g++)
+        compat = a[g] == 0;
+    if (!compat && strcmp(mine, ref) != 0) {
+        fprintf(stderr, "fuzz_decode: addr_format gave \"%s\", inet_ntop "
+                        "gave \"%s\"\n", mine, ref);
+        fail("IPv6 text form differs from inet_ntop", iter);
+    }
+    tot->addrs++;
+}
+
+/* Write the summary, the top-N table and the CSV for whatever the fuzzed
+ * inputs left in the flow table, and check the CSV's shape. */
+static void fuzz_reports(const struct analysis *an)
+{
+    struct pcap_file_info info;
+    const struct flow **top;
+    size_t n = an->flows.count < 100 ? an->flows.count : 100;
+    unsigned long long lines = 0;
+    FILE *f = tmpfile();
+    int c;
+
+    if (f == NULL)
+        fail("cannot create temporary file for reports", 0);
+    memset(&info, 0, sizeof info);
+    info.version_major = 2;
+    info.version_minor = 4;
+    report_summary(f, "fuzz", &info, &an->stats, an->flows.count);
+    top = malloc((n ? n : 1) * sizeof *top);
+    if (top == NULL)
+        exit(1);
+    n = flow_table_top_n(&an->flows, n, top);
+    report_top_flows(f, top, n, an->flows.count);
+    free(top);
+    if (ferror(f))
+        fail("report write failed", 0);
+    fclose(f);
+
+    f = tmpfile();
+    if (f == NULL)
+        fail("cannot create temporary file for CSV", 0);
+    if (report_csv(f, &an->flows) != 0)
+        fail("CSV write failed", 0);
+    rewind(f);
+    while ((c = getc(f)) != EOF)
+        lines += c == '\n';
+    fclose(f);
+    if (lines != (unsigned long long)an->flows.count + 1)
+        fail("CSV does not have one row per flow plus a header", 0);
+    printf("reports: summary, top %zu table and %zu-row CSV written\n", n,
+           an->flows.count);
 }
 
 int main(int argc, char **argv)
@@ -336,8 +509,7 @@ int main(int argc, char **argv)
     unsigned long long iterations = 200000, seed = 1, i;
     struct bytebuf seeds[MAX_SEEDS];
     size_t nseeds, k;
-    struct stats st;
-    struct flow_table flows;
+    struct analysis an;
     struct totals tot;
     uint8_t work[MAX_FRAME + 64];
 
@@ -354,8 +526,7 @@ int main(int argc, char **argv)
         bb_init(&seeds[k]);
     nseeds = build_seeds(seeds);
     memset(&tot, 0, sizeof tot);
-    stats_init(&st);
-    if (flow_table_init(&flows, 0) != 0)
+    if (analysis_init(&an) != 0)
         return 1;
 
     for (i = 0; i < iterations; i++) {
@@ -372,16 +543,16 @@ int main(int argc, char **argv)
         wirelen = (rng() & 1) ? len : len + rng_below(3000);
 
         ds = decode_exact(work, len, wirelen, &pi);
-        check_invariants(&pi, ds, i);
+        check_invariants(&pi, ds, wirelen == len, i);
         tot.frames++;
         tot.by_status[ds]++;
-        stats_add(&st, &pi, (uint32_t)len, (uint32_t)wirelen, i);
-        if (ds == DEC_OK && flow_table_add_packet(&flows, &pi,
-                                                  (uint32_t)wirelen, i) != 0)
+        if (analysis_account(&an, &pi, (uint32_t)len, (uint32_t)wirelen,
+                             i) != 0)
             fail("flow table out of memory", i);
 
         if ((i & 3) == 0)
-            fuzz_reader(seeds, nseeds, &st, &flows, &tot, i);
+            fuzz_reader(seeds, nseeds, &an, &tot, i);
+        fuzz_addr(&tot, i);
     }
 
     printf("fuzz_decode: %llu iterations, seed %llu\n", iterations, seed);
@@ -392,17 +563,22 @@ int main(int argc, char **argv)
                    decode_status_str((enum decode_status)k),
                    tot.by_status[k]);
     }
-    printf("reader: %llu mutated pcap files, %llu records decoded\n",
+    printf("reader: %llu mutated pcap files (each read from memory and "
+           "through stdio), %llu records decoded\n",
            tot.files, tot.file_records);
     for (k = 0; k <= PCAP_ERR_BAD_CAPLEN; k++) {
         if (tot.file_outcome[k] > 0)
             printf("  %-38s %llu\n", pcap_status_str((enum pcap_status)k),
                    tot.file_outcome[k]);
     }
-    printf("flow table: %zu flows\n", flows.count);
+    printf("addresses: %llu IPv6 addresses checked against inet_ntop\n",
+           tot.addrs);
+    printf("flow table: %zu flows, %llu later fragments matched\n",
+           an.flows.count, (unsigned long long)an.stats.frag_matched);
+    fuzz_reports(&an);
     printf("result: no crashes, no sanitizer reports, all invariants held\n");
 
-    flow_table_free(&flows);
+    analysis_free(&an);
     for (k = 0; k < nseeds; k++)
         bb_free(&seeds[k]);
     return 0;

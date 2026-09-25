@@ -54,6 +54,12 @@ void stats_add(struct stats *s, const struct packet_info *pi,
     else if (pi->frag == FRAG_LATER)
         s->frag_later++;
 
+    /* An IPv6 packet whose extension-header chain is broken never reached
+     * its transport header, so there is no transport protocol to count. It
+     * is already counted as truncated or malformed above. */
+    if (pi->status == DEC_TRUNC_IPV6_EXT || pi->status == DEC_BAD_IPV6_EXT)
+        return;
+
     switch (pi->ip_proto) {
     case IPPROTO_NUM_TCP:    s->tcp++; break;
     case IPPROTO_NUM_UDP:    s->udp++; break;

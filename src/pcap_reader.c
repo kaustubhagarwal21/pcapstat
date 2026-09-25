@@ -100,6 +100,13 @@ enum pcap_status pcap_parse_record_header(const struct pcap_file_info *info,
     if (rec->caplen > PCAP_MAX_CAPLEN)
         return PCAP_ERR_BAD_CAPLEN;
 
+    /* A frame cannot have been shorter on the wire than the bytes we hold
+     * of it. A writer that gets this wrong would otherwise make the "bytes
+     * on the wire" totals smaller than "bytes captured", so trust the bytes
+     * that are really there (the decoder does the same). */
+    if (rec->wirelen < rec->caplen)
+        rec->wirelen = rec->caplen;
+
     /* Done in 64-bit arithmetic: sec * 1e9 needs up to 63 bits, and
      * frac * 1000 would overflow 32 bits for a corrupt microsecond value.
      * The worst case, (2^32 - 1) * 1e9 + (2^32 - 1) * 1000, still fits in a
@@ -177,20 +184,13 @@ static enum pcap_status read_global_header(struct pcap_reader *r)
     return pcap_parse_global_header(hdr, PCAP_GLOBAL_HDR_LEN, &r->info);
 }
 
-enum pcap_status pcap_open_file(struct pcap_reader *r, const char *path)
+/* Shared by pcap_open_file and pcap_open_stream: take ownership of fp,
+ * allocate the record buffer and read the global header. */
+static enum pcap_status open_stream(struct pcap_reader *r, FILE *fp)
 {
     enum pcap_status st;
 
-    reader_reset(r);
-    r->fp = fopen(path, "rb");
-    if (r->fp == NULL) {
-        r->sys_errno = errno;
-        return r->error = PCAP_ERR_OPEN;
-    }
-    /* A bigger stdio buffer turns millions of small fread() calls into a
-     * few large read() syscalls. Failure here is harmless, so it is ignored. */
-    (void)setvbuf(r->fp, NULL, _IOFBF, READ_BUFFER_SIZE);
-
+    r->fp = fp;
     r->buf = malloc(PCAP_MAX_CAPLEN);
     if (r->buf == NULL) {
         st = PCAP_ERR_NOMEM;
@@ -204,6 +204,31 @@ enum pcap_status pcap_open_file(struct pcap_reader *r, const char *path)
         r->error = st;
     }
     return st;
+}
+
+enum pcap_status pcap_open_file(struct pcap_reader *r, const char *path)
+{
+    FILE *fp;
+
+    reader_reset(r);
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        r->sys_errno = errno;
+        return r->error = PCAP_ERR_OPEN;
+    }
+    /* A bigger stdio buffer turns millions of small fread() calls into a
+     * few large read() syscalls. It must be set before the first read.
+     * Failure here is harmless, so it is ignored. */
+    (void)setvbuf(fp, NULL, _IOFBF, READ_BUFFER_SIZE);
+    return open_stream(r, fp);
+}
+
+enum pcap_status pcap_open_stream(struct pcap_reader *r, FILE *fp)
+{
+    reader_reset(r);
+    if (fp == NULL)
+        return r->error = PCAP_ERR_OPEN;
+    return open_stream(r, fp);
 }
 
 enum pcap_status pcap_open_mem(struct pcap_reader *r, const uint8_t *data,

@@ -53,6 +53,7 @@ enum decode_status {
     DEC_TRUNC_UDP,
     DEC_TRUNC_ICMP,
 
+    DEC_BAD_SHORT_FRAME,      /* whole frame shorter than a fixed-size header */
     DEC_BAD_VLAN_DEPTH,       /* more than DECODE_MAX_VLANS tags */
     DEC_BAD_IPV4_VERSION,     /* ethertype says IPv4, version nibble disagrees */
     DEC_BAD_IPV4_IHL,         /* header length below the 20-byte minimum */
@@ -89,10 +90,14 @@ struct packet_info {
 
     /* L3 */
     uint8_t ip_version;                 /* 4 or 6 when has_l3 */
-    uint8_t ip_proto;                   /* IPv4 protocol / IPv6 final next header */
+    uint8_t ip_proto;                   /* IPv4 protocol / IPv6 final next header;
+                                           left 0 if the IPv6 extension chain
+                                           is broken before its end */
     uint8_t src_addr[16];               /* IPv4 uses the first 4 bytes, rest 0 */
     uint8_t dst_addr[16];
     enum frag_kind frag;
+    uint32_t frag_id;                   /* IPv4 identification or IPv6 fragment
+                                           header ID; meaningful when fragmented */
 
     /* L4 (valid when has_l4) */
     uint16_t src_port;                  /* TCP/UDP only */

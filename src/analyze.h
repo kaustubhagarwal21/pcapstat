@@ -4,17 +4,29 @@
 #ifndef PCAPSTAT_ANALYZE_H
 #define PCAPSTAT_ANALYZE_H
 
+#include "decode.h"
 #include "flow.h"
+#include "frag.h"
 #include "pcap_reader.h"
 #include "stats.h"
 
 struct analysis {
     struct stats stats;
     struct flow_table flows;
+    struct frag_cache frags;
 };
 
-/* Returns 0 on success, -1 if out of memory. */
+/* Returns 0 on success, -1 if out of memory (nothing is left allocated). */
 int analysis_init(struct analysis *a);
+
+/*
+ * Account one decoded packet: attribute it if it is a later fragment,
+ * update the global counters and, if it decoded cleanly, its flow. `pi` may
+ * be modified (a later fragment can receive its datagram's ports). Returns
+ * 0, or -1 if the flow table could not grow.
+ */
+int analysis_account(struct analysis *a, struct packet_info *pi,
+                     uint32_t caplen, uint32_t wirelen, uint64_t ts_ns);
 
 /*
  * Read every record from `r`, decode it and account it. Returns PCAP_EOF if

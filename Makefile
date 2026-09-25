@@ -18,7 +18,7 @@ CFLAGS  ?= -std=c11 -O2 $(WARN)
 SANFLAGS := -std=c11 -O1 -g -fsanitize=address,undefined \
             -fno-sanitize-recover=all -fno-omit-frame-pointer $(WARN)
 
-LIB_SRC := src/pcap_reader.c src/decode.c src/flow.c src/stats.c \
+LIB_SRC := src/pcap_reader.c src/decode.c src/flow.c src/frag.c src/stats.c \
            src/addr.c src/report.c src/analyze.c
 HEADERS := $(wildcard src/*.h)
 TEST_SRC := tests/test_main.c tests/builder.c tests/test_pcap.c \

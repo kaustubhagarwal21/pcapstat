@@ -16,6 +16,12 @@
  * own length fields are inconsistent (malformed). Declared lengths from the
  * packet can only ever shrink a span, never grow it, so a lying length field
  * cannot move a read outside the buffer.
+ *
+ * Every "is there room?" check goes through need(), including the ones for
+ * fixed-size headers (Ethernet, VLAN tag, IPv4, IPv6). So a frame that was
+ * captured in full (caplen == wire length) keeps cap == wire at every layer
+ * and can never be reported as truncated: if it is too short for a header,
+ * the frame itself is at fault, and that is malformed.
  */
 #include "decode.h"
 
@@ -140,9 +146,11 @@ static enum decode_status decode_ipv4(struct span *s, struct packet_info *pi)
     const uint8_t *ip;
     size_t hlen, total;
     unsigned frag_offset, more_frags;
+    enum decode_status st;
 
-    if (s->cap < IPV4_MIN_HDR)
-        return DEC_TRUNC_IPV4;
+    st = need(s, IPV4_MIN_HDR, DEC_TRUNC_IPV4, DEC_BAD_SHORT_FRAME);
+    if (st != DEC_OK)
+        return st;
     ip = s->p;
     if ((ip[0] >> 4) != 4)
         return DEC_BAD_IPV4_VERSION;
@@ -152,6 +160,13 @@ static enum decode_status decode_ipv4(struct span *s, struct packet_info *pi)
         return DEC_BAD_IPV4_IHL;
 
     total = load_be16(ip + 2);
+    /* A total length of 0 shows up in packets captured on the sending host
+     * when the NIC does TCP segmentation offload (TSO): the stack hands the
+     * NIC one large packet and the NIC fills in the real lengths of the
+     * segments it cuts. Like Wireshark, assume the packet runs to the end of
+     * the frame. The checks below still apply. */
+    if (total == 0)
+        total = s->wire;
     if (total < hlen || total > s->wire)
         return DEC_BAD_IPV4_TOTAL_LEN;
     if (hlen > s->cap)
@@ -162,7 +177,9 @@ static enum decode_status decode_ipv4(struct span *s, struct packet_info *pi)
     memcpy(pi->src_addr, ip + 12, 4);
     memcpy(pi->dst_addr, ip + 16, 4);
 
-    /* Flags (3 bits) and fragment offset (13 bits, in 8-byte units). */
+    /* Flags (3 bits) and fragment offset (13 bits, in 8-byte units). The
+     * identification field ties the fragments of one datagram together. */
+    pi->frag_id = load_be16(ip + 4);
     frag_offset = load_be16(ip + 6) & 0x1FFFu;
     more_frags = load_be16(ip + 6) & 0x2000u;
     if (frag_offset != 0)
@@ -195,8 +212,9 @@ static enum decode_status decode_ipv6(struct span *s, struct packet_info *pi)
     unsigned next, hops = 0;
     enum decode_status st;
 
-    if (s->cap < IPV6_HDR_LEN)
-        return DEC_TRUNC_IPV6;
+    st = need(s, IPV6_HDR_LEN, DEC_TRUNC_IPV6, DEC_BAD_SHORT_FRAME);
+    if (st != DEC_OK)
+        return st;
     ip = s->p;
     if ((ip[0] >> 4) != 6)
         return DEC_BAD_IPV6_VERSION;
@@ -217,8 +235,10 @@ static enum decode_status decode_ipv6(struct span *s, struct packet_info *pi)
     advance(s, IPV6_HDR_LEN);
     clip(s, payload);
 
+    /* pi->ip_proto is only set once the chain has been walked to its end.
+     * If the chain is broken, the transport protocol is unknown, and it
+     * stays 0 rather than naming whichever extension header failed. */
     while (is_ipv6_ext(next)) {
-        pi->ip_proto = (uint8_t)next;
         if (hops++ == IPV6_MAX_EXT_HEADERS)
             return DEC_BAD_IPV6_EXT;
 
@@ -228,8 +248,10 @@ static enum decode_status decode_ipv6(struct span *s, struct packet_info *pi)
             st = need(s, IPV6_FRAG_LEN, DEC_TRUNC_IPV6_EXT, DEC_BAD_IPV6_EXT);
             if (st != DEC_OK)
                 return st;
-            /* 13-bit offset in 8-byte units, 2 reserved bits, M flag. */
+            /* 13-bit offset in 8-byte units, 2 reserved bits, M flag, then
+             * the 32-bit identification shared by all the fragments. */
             off_flags = load_be16(s->p + 2);
+            pi->frag_id = load_be32(s->p + 4);
             if ((off_flags >> 3) != 0)
                 pi->frag = FRAG_LATER;
             else if (off_flags & 1u)
@@ -274,8 +296,9 @@ enum decode_status decode_frame(const uint8_t *frame, size_t caplen,
     s.cap = caplen;
     s.wire = wirelen > caplen ? wirelen : caplen; /* keep cap <= wire */
 
-    if (s.cap < ETH_HDR_LEN)
-        return pi->status = DEC_TRUNC_ETHERNET;
+    pi->status = need(&s, ETH_HDR_LEN, DEC_TRUNC_ETHERNET, DEC_BAD_SHORT_FRAME);
+    if (pi->status != DEC_OK)
+        return pi->status;
     /* Bytes 0-5 destination MAC, 6-11 source MAC, 12-13 ethertype. */
     type = load_be16(s.p + 12);
     advance(&s, ETH_HDR_LEN);
@@ -287,8 +310,9 @@ enum decode_status decode_frame(const uint8_t *frame, size_t caplen,
            type == ETHERTYPE_QINQ_LEGACY) {
         if (pi->vlan_count == DECODE_MAX_VLANS)
             return pi->status = DEC_BAD_VLAN_DEPTH;
-        if (s.cap < VLAN_TAG_LEN)
-            return pi->status = DEC_TRUNC_VLAN;
+        pi->status = need(&s, VLAN_TAG_LEN, DEC_TRUNC_VLAN, DEC_BAD_SHORT_FRAME);
+        if (pi->status != DEC_OK)
+            return pi->status;
         pi->vlan_ids[pi->vlan_count++] = load_be16(s.p) & 0x0FFFu;
         type = load_be16(s.p + 2);
         advance(&s, VLAN_TAG_LEN);
@@ -327,6 +351,7 @@ const char *decode_status_str(enum decode_status s)
     case DEC_TRUNC_TCP:            return "truncated TCP header";
     case DEC_TRUNC_UDP:            return "truncated UDP header";
     case DEC_TRUNC_ICMP:           return "truncated ICMP header";
+    case DEC_BAD_SHORT_FRAME:      return "frame too short for its headers";
     case DEC_BAD_VLAN_DEPTH:       return "more than 2 VLAN tags";
     case DEC_BAD_IPV4_VERSION:     return "IPv4 ethertype with wrong IP version";
     case DEC_BAD_IPV4_IHL:         return "IPv4 header length < 20";

@@ -7,12 +7,31 @@
 
 #include "bytes.h"
 
+/* ::ffff:0:0/96, the IPv4-mapped prefix: 80 zero bits, then 16 one bits. */
+static int is_v4_mapped(const uint8_t *a)
+{
+    int i;
+
+    for (i = 0; i < 10; i++) {
+        if (a[i] != 0)
+            return 0;
+    }
+    return a[10] == 0xff && a[11] == 0xff;
+}
+
 static void format_ipv6(const uint8_t *a, char *buf, size_t len)
 {
     unsigned groups[8];
     int best_start = -1, best_len = 0, i;
     char tmp[ADDR_STR_LEN];
     size_t pos = 0;
+
+    /* RFC 5952 section 5: an IPv4-mapped address shows its embedded IPv4
+     * address in dotted-quad form, e.g. ::ffff:192.0.2.1. */
+    if (is_v4_mapped(a)) {
+        snprintf(buf, len, "::ffff:%u.%u.%u.%u", a[12], a[13], a[14], a[15]);
+        return;
+    }
 
     for (i = 0; i < 8; i++)
         groups[i] = load_be16(a + 2 * i);

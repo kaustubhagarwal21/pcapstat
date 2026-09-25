@@ -61,8 +61,9 @@ exit status: 0 ok, 1 usage error, 2 input error
 An input error covers a file that cannot be opened, is not a pcap file,
 turns out to be truncated or corrupt part-way through, or a CSV file that
 cannot be written. For a capture damaged part-way through, the summary for
-the records before the damage is still printed. Naming the input file as the
-`--csv` output is a usage error, so a slip cannot overwrite the capture.
+the records before the damage is still printed. Giving the input file's name
+as the `--csv` output is a usage error, so repeating the name by mistake
+cannot overwrite the capture.
 
 ## Sample output
 
@@ -134,7 +135,7 @@ Notes on reading it:
 
 | File | Role |
 |---|---|
-| `src/pcap_reader.{c,h}` | Global header and record parsing from a file or a memory buffer |
+| `src/pcap_reader.{c,h}` | Global header and record parsing from a file, an open stream or a memory buffer |
 | `src/decode.{c,h}` | Pure, bounds-checked frame decoder producing a `struct packet_info` |
 | `src/flow.{c,h}` | Bidirectional flow key, open-addressing hash table, top-N selection |
 | `src/frag.{c,h}` | Direct-mapped cache that gives later IP fragments their datagram's ports |
@@ -370,30 +371,48 @@ Two checks that the fuzzer finds real bugs, each on a scratch copy:
 
 **Compilers.** Locally (WSL2, Ubuntu 24.04), `make`, `make test`,
 `make asan` and `make fuzz FUZZ_ITERS=1000000` all pass with gcc 13.3.0 and
-with clang 17.0.6 (`make CC=clang`). CI runs `make`, `make test`,
+with clang 17.0.6 (`make CC=/usr/lib/llvm-17/bin/clang ...`). CI runs `make`, `make test`,
 `make asan` and `make fuzz FUZZ_ITERS=50000` with both compilers on
 `ubuntu-latest`.
 
 ## Benchmarks
 
-Measured by running `./build/pcapstat -n 5` on a generated 1,000,000-packet
-capture. There was one warm-up run, then 10 timed runs; the file was in the
-page cache, so this measures parsing and counting, not the disk.
+`./build/pcapstat -n 5` on a generated 1,000,000-packet capture: one warm-up
+run, then 5 timed runs. The file sat on WSL's own ext4 file system and was
+in the page cache, so this measures parsing, decoding and counting, not the
+disk. Each run was started by a small C helper that forks, `exec`s pcapstat
+with stdout sent to `/dev/null`, and waits with `wait4()`. Wall time comes
+from `CLOCK_MONOTONIC` around the whole process; peak RSS is `ru_maxrss`.
 
 | | |
 |---|---|
-| Capture | `python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000` → 789,683,198 bytes, 19,939 flows, 510 s of traffic (generated in 9.1 s) |
-| Machine | Intel Core i9-13900HX, WSL2 (kernel 5.15.167.4), Ubuntu 24.04, gcc 13.3.0, `-O2` |
-| Wall time | median **0.162 s** (min 0.157 s, max 0.172 s) |
-| Throughput | about **6.2 million packets/s**, 4.9 GB/s of capture file |
-| Peak memory | about 5.8 MB max RSS |
-| With `--csv` of all 19,939 flows | 0.17 s |
+| Capture | `python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --out ~/bench_1m.pcap` (generated in 9.1 s): 789,683,198 bytes, SHA-256 `c8143d00…2e57412`, 510 s of traffic, 19,584 flows |
+| Build | `make` (gcc 13.3.0, `-std=c11 -O2`) |
+| Machine | Intel Core i9-13900HX laptop (`lscpu`: 32 logical CPUs), Windows 11 host with 15.7 GiB RAM; WSL2 VM with 7.6 GiB, kernel 5.15.167.4-microsoft-standard-WSL2, Ubuntu 24.04.3 LTS. Host CPU load was 5% before the runs |
+| Wall time | median **0.165 s** over 5 runs (range 0.155–0.246 s) |
+| Throughput at the median | **6.05 million packets/s**; 4,780 MB/s of capture file (file size ÷ wall time) |
+| Peak RSS | **5.8–5.9 MiB** (5,908–6,036 KiB; the same helper reports 1,348 KiB for `/bin/true`) |
+| With `--csv` (19,584 rows) | median 0.174 s (range 0.171–0.199 s), 5.74 million packets/s |
+
+pcapstat is single-threaded, so these figures are for one core.
+
+To reproduce the runs:
+
+```sh
+python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --out ~/bench_1m.pcap
+make
+./build/pcapstat -n 5 ~/bench_1m.pcap > /dev/null          # warm-up
+for i in 1 2 3 4 5; do /usr/bin/time -f '%e s %M KiB' ./build/pcapstat -n 5 ~/bench_1m.pcap > /dev/null; done
+```
+
+(`/usr/bin/time` rounds to 10 ms; the figures above used the finer
+`CLOCK_MONOTONIC` helper described above.)
 
 `make bench` generates the capture (if missing) and times one run. By
 default the file is written to `bench/`. On WSL, keep it on the Linux file
-system, as in `make bench BENCH_PCAP=$HOME/bench_1m.pcap`: reading the same
-file from `/mnt/c` (Windows NTFS through WSL's 9P bridge) took 74–78 s. Only
-about 0.5 s of that was user CPU; the rest was waiting on I/O.
+system, as in `make bench BENCH_PCAP=$HOME/bench_1m.pcap`. A path under
+`/mnt/c` is read through WSL's 9P bridge to Windows NTFS, so the timing
+would include that bridge and not just the parser.
 
 ## Limitations
 

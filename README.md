@@ -2,9 +2,12 @@
 
 `pcapstat` is a small command-line tool in C11 that reads classic libpcap
 capture files (`.pcap`, as written by tcpdump and Wireshark). It decodes
-Ethernet, 802.1Q / 802.1ad VLAN tags, IPv4, IPv6, TCP, UDP, ICMP and ICMPv6,
-then reports per-protocol counts, decode problems and the largest
-bidirectional flows. It depends on nothing but the C standard library.
+Ethernet, 802.1Q / 802.1ad VLAN tags, IPv4, IPv6, TCP, UDP, ICMP and ICMPv6.
+It also decodes GTP-U, the tunnel that carries phones' IP packets between
+LTE/5G base stations and the mobile core, including the user packet inside
+each tunnel. It then reports per-protocol counts, decode problems, the
+largest bidirectional flows and the largest GTP-U tunnels. It depends on
+nothing but the C standard library.
 
 The project is an exercise in the parts of network software where C is
 unforgiving: parsing untrusted binary input, byte order, unaligned data,
@@ -34,6 +37,14 @@ code review alone.
 - Keeps bidirectional 5-tuple flows in an open-addressing hash table and
   prints the top N by bytes. Later IP fragments, which carry no ports, are
   matched to their datagram's flow. `--csv` writes every flow to a CSV file.
+- Decodes GTP-U (GTPv1-U, 3GPP TS 29.281) on UDP port 2152: the header
+  flags, the optional fields, the extension header chain and the message
+  types. The IPv4 or IPv6 user packet inside a G-PDU, with its TCP, UDP or
+  ICMP header, is decoded by the same bounds-checked code as the outer
+  packet. Tunnels are kept in a second hash table keyed by (outer source,
+  outer destination, TEID), and the top N by bytes are printed.
+  `--tunnels-csv` writes every tunnel to a CSV file. See
+  [GTP-U](#gtp-u-lte-s1-u-and-5g-n3).
 
 ## Build and run
 
@@ -42,18 +53,20 @@ sample and benchmark captures.
 
 ```sh
 make                  # release build: build/pcapstat
-make test             # 73 unit tests + 24 CLI checks
+make test             # 93 unit tests + 37 CLI checks
 make asan             # the same tests under ASan + UBSan
 make fuzz             # 200,000 fuzz iterations under ASan + UBSan
 make bench            # build a 1,000,000-packet capture, then time pcapstat on it
 ```
 
 ```text
-usage: pcapstat [-n N] [--csv FILE] FILE.pcap
+usage: pcapstat [-n N] [--csv FILE] [--tunnels-csv FILE] FILE.pcap
 
-  -n N        show the top N flows by bytes (default 10, 0 hides the table)
-  --csv FILE  also write every flow to FILE as CSV
-  -h, --help  show this help
+  -n N                show the top N flows and tunnels by bytes
+                      (default 10, 0 hides the tables)
+  --csv FILE          also write every flow to FILE as CSV
+  --tunnels-csv FILE  also write every GTP-U tunnel to FILE as CSV
+  -h, --help          show this help
 
 exit status: 0 ok, 1 usage error, 2 input error
 ```
@@ -61,9 +74,9 @@ exit status: 0 ok, 1 usage error, 2 input error
 An input error covers a file that cannot be opened, is not a pcap file,
 turns out to be truncated or corrupt part-way through, or a CSV file that
 cannot be written. For a capture damaged part-way through, the summary for
-the records before the damage is still printed. Giving the input file's name
-as the `--csv` output is a usage error, so repeating the name by mistake
-cannot overwrite the capture.
+the records before the damage is still printed. Naming the input file as a
+CSV output, or the same file for both CSVs, is a usage error, so repeating
+a name by mistake cannot overwrite the capture or the other CSV.
 
 ## Sample output
 
@@ -124,24 +137,190 @@ Notes on reading it:
   `src_addr,src_port,dst_addr,dst_port,protocol,ip_version,packets,bytes,first_ts,last_ts,duration_s,tcp_flags`,
   with timestamps as `seconds.nanoseconds`.
 
+## GTP-U (LTE S1-U and 5G N3)
+
+In a mobile network, a phone's IP packets do not cross the operator's
+network as plain IP. The base station (an LTE eNodeB or a 5G gNodeB) wraps
+each uplink packet in GTP-U, the GPRS Tunnelling Protocol for user data
+(3GPP TS 29.281), and sends it over UDP port 2152 to the core network's
+user-plane node: the SGW-U in LTE, the UPF in 5G. Downlink packets travel
+the same way in the other direction. This link is called S1-U in LTE and N3
+in 5G. Each GTP-U header carries a TEID (tunnel endpoint identifier) that
+tells the receiver which bearer or PDU session, and so which phone, the
+packet belongs to. A capture on that link therefore has two sets of
+addresses: the outer ones (base station and core) and the inner ones (phone
+and the server it talks to).
+
+```text
+Ethernet | IP base station -> core | UDP 2152 | GTP-U TEID | IP phone -> server | TCP/UDP/ICMP | data
+         |<------------ outer packet: flows ------------->|<------------- user packet ------------->|
+```
+
+### What is decoded
+
+- **Detection.** An unfragmented UDP datagram with port 2152 on either side
+  and at least 8 bytes of payload is decoded as GTP-U. Either port is
+  enough: an Echo Response goes back to the port the request came from, so
+  only its source port is 2152.
+- **Header.** Version and PT (protocol type), the E, S and PN flags, the
+  message type, the length and the TEID. A header with a version other than
+  1, or with PT 0 (GTP', used for charging data), is counted and not
+  decoded further.
+- **Optional fields and extension headers.** If any of E, S or PN is set, 4
+  more bytes follow: sequence number, N-PDU number and the type of the
+  first extension header. The extension header chain is walked: each
+  header's length is in 4-byte units and must be at least 1, and the type
+  of the next header is in its last byte. 5G traffic normally carries one,
+  the PDU Session Container (type 0x85), which holds the QoS flow ID.
+- **Message types.** A G-PDU (255) carries a user packet. Echo Request (1),
+  Echo Response (2), Error Indication (26) and End Marker (254) are counted
+  by type, and any other type as "other". Their information elements are
+  not decoded.
+- **The user packet.** Its first 4 bits select IPv4 or IPv6, and it goes
+  through the same `decode_ipv4()` / `decode_ipv6()` functions as the outer
+  packet. It gets the same checks (IHL, total length, extension headers,
+  TCP data offset, UDP length), and its addresses, protocol and ports are
+  kept in `struct packet_info` next to the outer ones.
+
+### The same rules, one level down
+
+- **Spans all the way down.** The UDP length bounds the GTP-U message. The
+  GTP-U length counts the bytes after the first 8; it must fit in the UDP
+  payload, and it then bounds the extension headers and the user packet,
+  whose own lengths must fit in what is left. Each length can only shrink
+  the span. A GTP-U length larger than the UDP payload is **malformed**
+  even in a cut-short capture, because the UDP length that proves it is in
+  the captured bytes. A consistent message cut by the snapshot length is
+  **truncated**. A complete frame's GTP-U message is never called
+  truncated; a unit test sweep and a fuzzer invariant check this.
+- **The outer packet is not affected.** `pi->status` and the outer flow
+  table are exactly what they were before GTP-U decoding existed. A problem
+  inside the tunnel is recorded in a separate `pi->gtp_status`, using the
+  same list of reasons, and counted in the GTP-U part of the summary. A
+  G-PDU with a broken extension header still counts in its outer UDP flow,
+  because the outer headers are fine.
+- **Zero-length extension headers.** A length of 0 would describe a header
+  too short to hold even its own length byte, and accepting it would let
+  the walk stand still. It has its own malformation reason. The chain is
+  also capped at 16 headers, so a crafted chain cannot make the loop run
+  long.
+- **No recursion.** GTP-U is decoded in `decode_frame()`, after the outer
+  packet. The user packet goes through `decode_ipv4()` / `decode_ipv6()`
+  and then `decode_l4()`, and none of them calls the GTP-U decoder. So a
+  GTP-U packet inside a tunnel is flagged and counted but never decoded,
+  however deeply a crafted packet nests.
+- **Fragments.** A GTP-U datagram split into IP fragments is counted but
+  not decoded, since there is no reassembly: its first fragment holds only
+  part of the message.
+
+### Tunnels
+
+A cleanly decoded G-PDU is also added to a second hash table, keyed by
+(outer source, outer destination, TEID). Unlike a flow key, a tunnel key is
+not put in canonical order. The TEID is chosen by the node that receives
+the packets, so the uplink and the downlink of one session use different
+TEIDs, and two nodes can pick the same value independently. Each direction
+is therefore its own tunnel. The tunnel table uses the same `flow_table`
+code, with the TEID added to the key (it is 0 in ordinary flows), so it
+shares the hashing, probing, growth and top-N code and their tests. Adding
+the TEID did not make a table slot bigger: with the single-byte fields
+moved up next to the key, it fits in what used to be padding, and a slot is
+still 88 bytes.
+
+The report shows the top N tunnels by bytes. `--tunnels-csv FILE` writes
+every tunnel, largest first:
+`teid,src_addr,dst_addr,ip_version,packets,bytes,first_ts,last_ts,duration_s`.
+
+### Sample
+
+`samples/gtpu_sample.pcap` is a 300-packet capture produced by
+`tools/gen_pcap.py --seed 2 --packets 300 --flows 6 --gtp-fraction 0.9`
+(`make sample`):
+
+- two LTE eNodeBs and two 5G gNodeBs talk to one core node, one of them
+  over IPv6 on VLAN 300;
+- each phone session has its own uplink and downlink TEIDs and carries TCP,
+  DNS-like UDP, a UDP stream or ping, over IPv4 or IPv6;
+- 5G sessions carry a PDU Session Container, and some LTE sessions use
+  sequence numbers;
+- every base station exchanges echo requests with the core, and one
+  session ends with an End Marker, as after a handover.
+
+The rest is ordinary traffic. This is the unedited output of
+`./build/pcapstat -n 5 samples/gtpu_sample.pcap`:
+
+```text
+File:        samples/gtpu_sample.pcap
+Format:      pcap 2.4, little-endian, microsecond timestamps, snaplen 65535, Ethernet
+Packets:     300
+Bytes:       212520 on the wire, 212520 captured
+First:       2023-11-14 22:13:20.153165 UTC
+Last:        2023-11-14 22:13:21.426574 UTC
+Duration:    1.273409 s (235.6 packets/s, 1.335 Mbit/s)
+
+Network:     IPv4 272 (90.7%), IPv6 28 (9.3%), non-IP 0 (0.0%)
+Transport:   TCP 43, UDP 253, ICMP 4, ICMPv6 0, other 0
+VLAN:        15 tagged frames
+Fragments:   0 first, 0 non-first (0 matched to their first fragment's ports)
+Flows:       14
+Problems:    0 truncated, 0 malformed (excluded from flows)
+
+Top 5 of 14 flows by bytes (src = sender of the first packet seen):
+  #  proto   src                    dst                    packets       bytes      duration  tcp flags
+  1  UDP     172.16.1.21:2152       172.16.0.1:2152            191      190121       0.471 s  -
+  2  UDP     172.16.1.12:2152       172.16.0.1:2152             17        5873       0.687 s  -
+  3  TCP     [2001:db8:1::4]:60406  [2001:db8:ff::96]:22        13        4659       0.114 s  FSPA
+  4  UDP     172.16.1.11:2152       172.16.0.1:2152             14        3190       0.670 s  -
+  5  TCP     10.0.0.2:41157         198.51.100.182:80           10        2205       0.160 s  FSPA
+
+GTP-U:       249 packets on UDP port 2152
+  Messages:  G-PDU 230, echo request 9, echo response 9, error indication 0, end marker 1, other 0
+  Options:   sequence number in 35, extension headers in 199
+  Inner IP:  IPv4 123, IPv6 107; TCP 112, UDP 108, ICMP 4, ICMPv6 6, other 0
+  Tunnels:   20 (20 distinct TEIDs)
+  Skipped:   0 GTP' or other version, 0 GTP-U in GTP-U, 0 IP fragments on port 2152
+  Problems:  0 truncated, 0 malformed (excluded from tunnels)
+
+Top 5 of 20 GTP-U tunnels by bytes (one direction each; the receiver chose the TEID):
+  #  teid        src          dst           packets       bytes      duration
+  1  0xa15a3dfb  172.16.0.1   172.16.1.21        77       97558       0.223 s
+  2  0x01a02600  172.16.0.1   172.16.1.21        61       84169       0.127 s
+  3  0xb9e1ee87  172.16.1.21  172.16.0.1         34        4847       0.162 s
+  4  0x3fd446f9  172.16.0.1   172.16.1.12         8        3400       0.626 s
+  5  0x30c218e1  172.16.1.12  172.16.0.1          9        2473       0.687 s
+```
+
+Notes on reading it:
+
+- The flow table sees only the transport. Its row 1 is the 8 tunnels
+  between the gNodeB at 172.16.1.21 and the core, 191 packets in all,
+  merged into one UDP flow. The tunnel table splits that traffic by TEID.
+  Rows 1 and 2 are downlink tunnels (core to base station) and row 3 is an
+  uplink tunnel with far fewer bytes, which is what a download looks like.
+- The counts add up: the 230 G-PDUs carry 123 IPv4 and 107 IPv6 user
+  packets, and 112 TCP + 108 UDP + 4 ICMP + 6 ICMPv6 = 230.
+- The generator gives every session its own uplink and downlink TEID, so
+  the 20 tunnels are the two directions of 10 sessions.
+
 ## Design
 
 ```text
- pcap_reader  --record-->  decode  --packet_info-->  stats  (global counters)
- (file/memory)             (pure)                 \-> flow   (hash table, top-N)
+ pcap_reader  --record-->  decode  --packet_info-->  stats  (global and GTP-U counters)
+ (file/memory)             (pure)                 \-> flow   (flows and GTP-U tunnels:
+                                                        |     hash tables, top-N)
                                                         |
-                                           report: summary, table, CSV
+                                           report: summary, tables, CSVs
 ```
 
 | File | Role |
 |---|---|
 | `src/pcap_reader.{c,h}` | Global header and record parsing from a file, an open stream or a memory buffer |
-| `src/decode.{c,h}` | Pure, bounds-checked frame decoder producing a `struct packet_info` |
-| `src/flow.{c,h}` | Bidirectional flow key, open-addressing hash table, top-N selection |
+| `src/decode.{c,h}` | Pure, bounds-checked frame decoder, including GTP-U and the user packet inside it, producing a `struct packet_info` |
+| `src/flow.{c,h}` | Bidirectional flow key, directional tunnel key, open-addressing hash table, top-N selection |
 | `src/frag.{c,h}` | Direct-mapped cache that gives later IP fragments their datagram's ports |
-| `src/stats.{c,h}` | Capture-wide counters, including decode problems by reason |
+| `src/stats.{c,h}` | Capture-wide counters, including decode problems by reason and the GTP-U counters |
 | `src/analyze.{c,h}` | The read → decode → count loop, shared by the CLI, the tests and the fuzzer |
-| `src/report.{c,h}`, `src/addr.{c,h}` | Text output, CSV, RFC 5952 IPv6 formatting |
+| `src/report.{c,h}`, `src/addr.{c,h}` | Text output, CSVs, RFC 5952 IPv6 formatting |
 | `src/bytes.h`, `src/hash.h` | Explicit big/little-endian loads from byte buffers; FNV-1a |
 | `src/main.c` | Argument parsing and exit codes |
 
@@ -256,10 +435,12 @@ say, for example, "TCP data offset invalid: 3".
   heap's root to get in, so selection costs O(F log N) for F flows. The N
   winners are then sorted. Ties are broken by packets, then start time, then
   key, so the output is fully deterministic.
+- **Tunnels.** GTP-U tunnels live in a second table of the same kind, with
+  keys that keep their direction (see [Tunnels](#tunnels)).
 
 ## Testing
 
-`make test` runs 73 unit tests (42,257 individual checks) and 24 CLI checks.
+`make test` runs 93 unit tests (43,739 individual checks) and 37 CLI checks.
 The tests use a small assert framework in `tests/test.h` with no external
 dependencies. `tests/builder.c` builds frames and pcap files byte by byte, so
 each test states exactly what the decoder sees. The tests cover:
@@ -295,11 +476,45 @@ each test states exactly what the decoder sees. The tests cover:
   exact counters: a mixed capture, fragments joining their flow, complete
   short frames counted as malformed, and a broken IPv6 chain counted under
   no transport protocol.
+- **GTP-U** (`tests/test_gtpu.c`, 20 tests):
+  - G-PDUs with IPv4/TCP and with IPv6/UDP inside, and IPv6 transport on a
+    VLAN.
+  - The S, PN and E flags, including a non-zero next-type byte with E
+    clear, which must be ignored.
+  - One extension header, and a chain of two whose first header is 2 units
+    long, so a decoder that took the length as bytes would fail.
+  - Malformed chains: an extension length of 0, a header that overruns the
+    message, and a chain that promises another header after the message
+    ends. 16 headers are accepted and a 17th is refused.
+  - A GTP-U length larger than the UDP payload (malformed, even when the
+    capture was cut short), against a consistent message cut at each layer
+    (truncated). Also a length too short for the optional fields.
+  - Versions 0, 2 and 7, and PT 0 (GTP'), counted as not GTPv1-U.
+  - Echo request and response, error indication, end marker and an
+    unknown type.
+  - A payload that is not IP, an empty G-PDU, and a user packet too short
+    for its own header.
+  - GTP-U inside GTP-U, flagged and not decoded.
+  - Port 2152 as the source only and as the destination only; also a
+    7-byte payload, TCP on port 2152 and a first IP fragment, none of
+    which is decoded as GTP-U.
+  - Two prefix sweeps. First, every prefix of a message as the complete
+    payload of a UDP datagram: never truncated, and never OK unless whole.
+    Second, every snapshot-length cut of the full frame: never blamed on
+    the packet.
+  - A 15-frame capture that checks every GTP-U counter and the tunnel table
+    (direction, a TEID reused by another node, top-N). It also checks that
+    a G-PDU with a broken GTP-U header still counts in its outer flow.
+  - The exact tunnels CSV text and the GTP-U summary text.
 - **CLI** (`tests/cli_test.sh`): exit codes for `--help`, usage errors, a
   missing file, a non-pcap file, a truncated capture (partial stats plus exit
   2), an unwritable CSV path, and `--csv` naming the input file (refused,
   input untouched). It also checks the CSV header and that the CSV has one
-  row per flow.
+  row per flow. With the GTP-U sample, it checks the GTP-U section, the
+  tunnel table, the tunnels CSV header and one row per tunnel, and that
+  `-n 0` hides both tables. It also checks that a capture without GTP-U
+  has no GTP-U section, and that `--tunnels-csv` is refused when it names
+  the input file or the `--csv` file.
 
 **Sanitizers.** `make asan` builds the same tests and the CLI with
 `-fsanitize=address,undefined -fno-sanitize-recover=all`, so any UB report
@@ -313,17 +528,33 @@ order of function arguments unspecified, so `f(rng(), rng())` would replay
 differently under gcc and clang. With that rule, both compilers produce the
 same fuzz report, number for number. Each iteration does the following:
 
-- It takes one of 13 valid seed frames and applies 1–4 mutations: bit flips,
+- It takes one of 18 valid seed frames and applies 1–4 mutations: bit flips,
   random bytes, boundary values written at header offsets (0, 5, 20, 0xFFFF,
   ethertypes, ...), nibble rewrites (IP version, IHL, TCP data offset),
-  truncation and extension.
+  truncation and extension. Five of the seeds are GTP-U:
+  - a plain G-PDU;
+  - one with S, E and a PDU Session Container;
+  - one over IPv6 on a VLAN with a chain of two extension headers;
+  - an echo request;
+  - GTP-U inside GTP-U.
+- Half the time, a GTP-U seed first gets a change aimed at the fields that
+  steer the GTP-U parse: a flag bit (version, PT, E, S, PN), a boundary or
+  off-by-a-few value in the length, a next-type byte that starts a chain,
+  or an extension length of 0, 1, 2, 3 or 255.
 - It decodes the result from a heap buffer of *exactly* the mutated length,
   so ASan reports a read even one byte past the end, and then runs it
   through the same accounting as the tool (fragment cache, counters, flow
-  table).
+  and tunnel tables).
+- It decodes the same bytes a second time with 64 random bytes after them,
+  and every field of the two results must match: the decoder may not look
+  past `caplen`. ASan catches an over-read of the exact-size buffer; this
+  check would also catch one in a build without sanitizers.
 - It checks invariants on every result. For example: no L4 fields without a
-  valid L3 header, no ports read in non-first fragments, and a frame whose
-  captured length equals its wire length never classified as truncated.
+  valid L3 header, and no ports read in non-first fragments. A frame whose
+  captured length equals its wire length is never classified as truncated,
+  and neither is the GTP-U message inside it. GTP-U fields are never set
+  outside a clean, unfragmented UDP port 2152 datagram, and a clean G-PDU
+  always has an inner packet.
 - It formats one random IPv6 address (half its groups zero, sometimes
   IPv4-mapped) and compares the text with the C library's `inet_ntop()`.
 
@@ -332,42 +563,70 @@ corrupts record lengths (`caplen` and `origlen`) and random file bytes, and
 cuts the file at a random point. It then reads the file twice in lockstep:
 from memory, and through `fread()` from a `tmpfile()`. Both readers must
 return the same records and the same final status. At the end, the summary,
-top-N table and CSV are written for the whole fuzzed flow table, and the CSV
-must have exactly one row per flow.
+the GTP-U section, both top-N tables and both CSVs are written for the whole
+fuzzed flow and tunnel tables, and each CSV must have exactly one row per
+entry.
 
-`make fuzz` (200,000 iterations, seed 1) reached all 20 decoder outcomes and
-7 of the reader's format-error paths. pcapng detection is not reached by
-random mutation; a unit test covers it instead. Excerpt:
+`make fuzz` (200,000 iterations, seed 1) reached:
+
+- all 20 outcomes of the outer decoder;
+- inside GTP-U, all 7 GTP-U problem reasons, and 13 of the 14 that the
+  user packet can have (not "truncated IPv6 extension header");
+- 7 of the reader's format-error paths.
+
+pcapng detection is not reached by random mutation; a unit test covers it
+instead. Excerpt:
 
 ```text
 decoder: 200000 mutated frames
-  ok                                     139927
-  truncated Ethernet header              7558
+  ok                                     140387
+  truncated Ethernet header              7001
   ...                                    (all 19 problem reasons reached)
-  frame too short for its headers        17585
+  frame too short for its headers        16264
   ...
-  UDP length invalid                     2070
-reader: 50000 mutated pcap files (each read from memory and through stdio), 70429 records decoded
-  end of file                            28822
+  UDP length invalid                     3363
+GTP-U: 33547 of those frames decoded as GTP-U, 14837 with a valid inner packet
+  ok                                     20180
+  truncated IPv4 header                  439
+  ...                                    (13 user-packet reasons reached)
+  truncated GTP-U header                 567
+  truncated GTP-U extension header       146
+  G-PDU truncated before its IP packet   28
   ...
-  corrupt record: captured length exceeds 262144 bytes 5215
+  GTP-U length invalid                   5127
+  GTP-U extension header length 0        325
+  GTP-U extension header invalid         1051
+  G-PDU payload not IPv4 or IPv6         1372
+reader: 50000 mutated pcap files (each read from memory and through stdio), 70604 records decoded
+  end of file                            28691
+  ...
+  corrupt record: captured length exceeds 262144 bytes 5310
 addresses: 200000 IPv6 addresses checked against inet_ntop
-flow table: 30815 flows, 14550 later fragments matched
-reports: summary, top 100 table and 30815-row CSV written
+flow table: 29633 flows, 11533 later fragments matched; tunnel table: 3384 tunnels
+reports: summary, GTP-U section, top 100 flow and top 100 tunnel tables, 29633-row and 3384-row CSVs written
 result: no crashes, no sanitizer reports, all invariants held
 ```
 
 A longer run, `make fuzz FUZZ_ITERS=1000000`, also passes: 1,000,000
-mutated frames, 250,000 mutated files (353,901 records) and 1,000,000
-addresses, with a byte-identical report from gcc 13.3.0 and clang 17.0.6.
+mutated frames (168,400 of them decoded as GTP-U), 250,000 mutated files
+(354,460 records) and 1,000,000 addresses, with a byte-identical report
+from gcc 13.3.0 and clang 17.0.6.
 
-Two checks that the fuzzer finds real bugs, each on a scratch copy:
+Four checks that the fuzzer finds real bugs, each on a scratch copy:
 
 - With the `hlen > cap` check in `decode_ipv4` deleted, `make fuzz` failed
   with an ASan `heap-buffer-overflow` report in `decode_l4`.
 - With the IPv4 fixed-header check changed back to the old
   `if (cap < 20) return DEC_TRUNC_IPV4`, it failed at iteration 23:
   "complete frame classified as truncated".
+- With the bounds check before a GTP-U extension header's next-type byte
+  deleted, it failed with an ASan `heap-buffer-overflow` report in
+  `decode_gtpu`.
+- With the check that the GTP-U length fits in the UDP payload deleted, it
+  failed at iteration 104: "complete frame's GTP-U message classified as
+  truncated". No memory was read wrongly. The lying length only raised the
+  `wire` bound and never `cap`, so the cap/wire invariant was the only
+  thing that could notice.
 
 **Compilers.** Locally (WSL2, Ubuntu 24.04), `make`, `make test`,
 `make asan` and `make fuzz FUZZ_ITERS=1000000` all pass with gcc 13.3.0 and
@@ -377,29 +636,63 @@ with clang 17.0.6 (`make CC=/usr/lib/llvm-17/bin/clang ...`). CI runs `make`, `m
 
 ## Benchmarks
 
-`./build/pcapstat -n 5` on a generated 1,000,000-packet capture: one warm-up
-run, then 5 timed runs. The file sat on WSL's own ext4 file system and was
-in the page cache, so this measures parsing, decoding and counting, not the
-disk. Each run was started by a small C helper that forks, `exec`s pcapstat
-with stdout sent to `/dev/null`, and waits with `wait4()`. Wall time comes
-from `CLOCK_MONOTONIC` around the whole process; peak RSS is `ru_maxrss`.
+`./build/pcapstat -n 5` on two generated 1,000,000-packet captures, one of
+ordinary traffic and one mostly GTP-U: one warm-up run, then 5 timed runs
+each. The files sat on WSL's own ext4 file system and were in the page
+cache, so this measures parsing, decoding and counting, not the disk. Each
+run was started by a small C helper that forks, `exec`s pcapstat with stdout
+sent to `/dev/null`, and waits with `wait4()`. Wall time comes from
+`CLOCK_MONOTONIC` around the whole process; peak RSS is `ru_maxrss`. All the
+figures below come from one session.
 
 | | |
 |---|---|
-| Capture | `python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --out ~/bench_1m.pcap` (generated in 9.1 s): 789,683,198 bytes, SHA-256 `c8143d00…2e57412`, 510 s of traffic, 19,584 flows |
 | Build | `make` (gcc 13.3.0, `-std=c11 -O2`) |
-| Machine | Intel Core i9-13900HX laptop (`lscpu`: 32 logical CPUs), Windows 11 host with 15.7 GiB RAM; WSL2 VM with 7.6 GiB, kernel 5.15.167.4-microsoft-standard-WSL2, Ubuntu 24.04.3 LTS. Host CPU load was 5% before the runs |
-| Wall time | median **0.165 s** over 5 runs (range 0.155–0.246 s) |
-| Throughput at the median | **6.05 million packets/s**; 4,780 MB/s of capture file (file size ÷ wall time) |
-| Peak RSS | **5.8–5.9 MiB** (5,908–6,036 KiB; the same helper reports 1,348 KiB for `/bin/true`) |
-| With `--csv` (19,584 rows) | median 0.174 s (range 0.171–0.199 s), 5.74 million packets/s |
+| Machine | Intel Core i9-13900HX laptop (`lscpu`: 32 logical CPUs), Windows 11 host with 15.7 GiB RAM; WSL2 VM with 7.6 GiB, kernel 5.15.167.4-microsoft-standard-WSL2, Ubuntu 24.04.3 LTS. Host CPU load was 2% before the runs |
+
+Ordinary traffic:
+
+| | |
+|---|---|
+| Capture | `python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --out ~/bench_1m.pcap` (generated in 10.2 s): 789,683,198 bytes, SHA-256 `c8143d00…2e57412`, 510 s of traffic, 19,584 flows, no GTP-U |
+| Wall time | median **0.171 s** over 5 runs (range 0.167–0.173 s) |
+| Throughput at the median | **5.87 million packets/s**; 4,632 MB/s of capture file (file size ÷ wall time) |
+| Peak RSS | **5.7–5.9 MiB** (5,824–6,004 KiB; the same helper reports 1,352 KiB for `/bin/true`) |
+| With `--csv` (19,584 rows) | median 0.184 s (range 0.177–0.185 s), 5.44 million packets/s |
+
+GTP-U traffic:
+
+| | |
+|---|---|
+| Capture | `python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 2000 --gtp-fraction 0.9 --out ~/bench_gtp_1m.pcap` (generated in 19.6 s): 705,568,084 bytes, SHA-256 `c49c3df5…b0fdd5f`, 508 s of traffic; 887,506 GTP-U packets, 880,230 of them G-PDUs whose user packet is decoded too; 71,469 tunnels and 1,976 outer flows |
+| Wall time | median **0.224 s** over 5 runs (range 0.220–0.230 s) |
+| Throughput at the median | **4.46 million packets/s**; 3,146 MB/s of capture file |
+| Peak RSS | **18.3–18.4 MiB** (18,688–18,808 KiB). The tunnel table has grown to 131,072 slots of 88 bytes (11 MiB) |
+| With `--tunnels-csv` (71,469 rows) | median 0.272 s (range 0.268–0.274 s), 3.68 million packets/s |
 
 pcapstat is single-threaded, so these figures are for one core.
+
+**What GTP-U support costs on traffic without GTP-U.** In the same
+session, the previous commit (before GTP-U) and this one were each run 25
+times, interleaved, on the first capture. The medians were 0.157 s and
+0.169 s, so this commit is about 8% slower. Five variants each undid or
+worked around one part of the change:
+
+- the TEID left out of the flow hash;
+- the GTP-U dispatch removed from the decoder;
+- the GTP-U counters removed;
+- the old flow slot layout;
+- `packet_info` cleared in two parts instead of one. At 128 bytes it is
+  past the 80 bytes up to which GCC clears with vector stores; above that,
+  GCC uses `rep stos`.
+
+Each variant won back 1% or less, so no single cause has been found.
 
 To reproduce the runs:
 
 ```sh
 python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 20000 --out ~/bench_1m.pcap
+python3 tools/gen_pcap.py --seed 1 --packets 1000000 --flows 2000 --gtp-fraction 0.9 --out ~/bench_gtp_1m.pcap
 make
 ./build/pcapstat -n 5 ~/bench_1m.pcap > /dev/null          # warm-up
 for i in 1 2 3 4 5; do /usr/bin/time -f '%e s %M KiB' ./build/pcapstat -n 5 ~/bench_1m.pcap > /dev/null; done
@@ -428,11 +721,26 @@ would include that bridge and not just the parser.
 - An IPv4 total length of 0 is read as TCP segmentation offload ("to the end
   of the frame"), not as an error, so a corrupt 0 in a normal packet is not
   flagged.
-- The `--csv` guard compares file names, so `--csv ./cap.pcap cap.pcap` is
-  not caught. Catching every spelling would need POSIX `stat()`.
+- The `--csv` and `--tunnels-csv` guards compare file names, so
+  `--csv ./cap.pcap cap.pcap` is not caught. Catching every spelling would
+  need POSIX `stat()`.
 - IPv6 jumbograms are not supported. AH/ESP and other headers are not walked
   and count as "other" protocols.
 - At most two VLAN tags. A third is reported as a decode problem.
+- GTP-U only, recognised on UDP port 2152 only. Nothing that sets tunnels
+  up is decoded: not GTP-C (GTPv2-C on port 2123, the LTE control plane),
+  not PFCP (N4, the 5G core's control of the UPF), and not S1AP or NGAP
+  (the base station's signalling). So a tunnel cannot be tied to a
+  subscriber or a session; it is just (source, destination, TEID).
+- The information elements of echo, error indication and other signalling
+  messages are not decoded, nor are extension header contents (for
+  example the QoS flow ID in a PDU Session Container).
+- No reassembly inside tunnels either. A GTP-U datagram split into IP
+  fragments is counted, not decoded; a user packet that is itself an IP
+  fragment is decoded as a fragment and not reassembled; and GTP-U inside
+  GTP-U is counted, not decoded.
+- User packets are decoded but not grouped into flows of their own: the
+  tables show outer flows and tunnels, not the phones' conversations.
 - The flow table grows without eviction (about 88 bytes per slot), so memory
   grows with the number of distinct flows. FNV-1a is not keyed, so traffic
   crafted to collide could slow the table down. A long-running monitor would
@@ -445,8 +753,10 @@ would include that bridge and not just the parser.
 src/            the tool (C11, libc only)
 tests/          unit tests, test framework, packet/pcap builder, CLI tests
 fuzz/           mutation fuzzer
-tools/          gen_pcap.py: deterministic mixed-traffic capture generator
-samples/        sample.pcap (400 packets, from gen_pcap.py --seed 17)
+tools/          gen_pcap.py: deterministic mixed-traffic capture generator,
+                optionally with GTP-U traffic (--gtp-fraction)
+samples/        sample.pcap (400 packets, from gen_pcap.py --seed 17) and
+                gtpu_sample.pcap (300 packets, --seed 2 --gtp-fraction 0.9)
 .github/        CI: gcc and clang; build, tests, sanitizers, fuzzing
 ```
 

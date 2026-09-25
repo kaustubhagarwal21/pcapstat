@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compiler version
+        run: $CC --version
+
+      # Newer runner kernels use more ASLR entropy than some sanitizer
+      # runtimes expect, which can make ASan binaries crash at startup.
+      - name: Sanitizer-friendly ASLR setting
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Build (-Wall -Wextra -Wpedantic -Werror)
+        run: make
+
+      - name: Unit and CLI tests
+        run: make test
+
+      - name: Tests under AddressSanitizer + UndefinedBehaviorSanitizer
+        run: make asan
+
+      - name: Mutation fuzzing under ASan + UBSan
+        run: make fuzz FUZZ_ITERS=50000

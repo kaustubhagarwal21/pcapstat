@@ -20,7 +20,7 @@
  * result never depends on padding bytes, whose values C leaves unspecified. */
 static uint64_t key_hash(const struct flow_key *k)
 {
-    uint8_t head[6];
+    uint8_t head[10];
     uint64_t h;
 
     head[0] = k->ip_version;
@@ -29,6 +29,10 @@ static uint64_t key_hash(const struct flow_key *k)
     head[3] = (uint8_t)k->port_a;
     head[4] = (uint8_t)(k->port_b >> 8);
     head[5] = (uint8_t)k->port_b;
+    head[6] = (uint8_t)(k->teid >> 24);
+    head[7] = (uint8_t)(k->teid >> 16);
+    head[8] = (uint8_t)(k->teid >> 8);
+    head[9] = (uint8_t)k->teid;
     h = fnv1a(FNV64_OFFSET, head, sizeof head);
     h = fnv1a(h, k->addr_a, sizeof k->addr_a);
     return fnv1a(h, k->addr_b, sizeof k->addr_b);
@@ -36,7 +40,8 @@ static uint64_t key_hash(const struct flow_key *k)
 
 static int key_equal(const struct flow_key *a, const struct flow_key *b)
 {
-    return a->ip_version == b->ip_version && a->proto == b->proto &&
+    return a->teid == b->teid &&
+           a->ip_version == b->ip_version && a->proto == b->proto &&
            a->port_a == b->port_a && a->port_b == b->port_b &&
            memcmp(a->addr_a, b->addr_a, sizeof a->addr_a) == 0 &&
            memcmp(a->addr_b, b->addr_b, sizeof a->addr_b) == 0;
@@ -47,6 +52,8 @@ static int key_cmp(const struct flow_key *a, const struct flow_key *b)
 {
     int c;
 
+    if (a->teid != b->teid)
+        return a->teid < b->teid ? -1 : 1;
     if (a->ip_version != b->ip_version)
         return a->ip_version < b->ip_version ? -1 : 1;
     if (a->proto != b->proto)
@@ -208,16 +215,15 @@ struct flow *flow_table_find_or_insert(struct flow_table *t,
     return &t->slots[i];
 }
 
-int flow_table_add_packet(struct flow_table *t, const struct packet_info *pi,
-                          uint32_t wire_len, uint64_t ts_ns)
+/* Add one packet to the entry for `key`, creating it if needed. */
+static int account(struct flow_table *t, const struct flow_key *key,
+                   int reversed, uint8_t tcp_flags, uint32_t wire_len,
+                   uint64_t ts_ns)
 {
-    struct flow_key key;
     struct flow *f;
-    int reversed, inserted;
+    int inserted;
 
-    if (!flow_key_from_packet(pi, &key, &reversed))
-        return 0;
-    f = flow_table_find_or_insert(t, &key, &inserted);
+    f = flow_table_find_or_insert(t, key, &inserted);
     if (f == NULL)
         return -1;
 
@@ -237,8 +243,76 @@ int flow_table_add_packet(struct flow_table *t, const struct packet_info *pi,
 
     f->packets++;
     f->bytes += wire_len;
+    f->tcp_flags |= tcp_flags;
+    return 0;
+}
+
+int flow_table_add_packet(struct flow_table *t, const struct packet_info *pi,
+                          uint32_t wire_len, uint64_t ts_ns)
+{
+    struct flow_key key;
+    int reversed;
+    uint8_t flags = 0;
+
+    if (!flow_key_from_packet(pi, &key, &reversed))
+        return 0;
     if (pi->ip_proto == IPPROTO_NUM_TCP && pi->has_l4)
-        f->tcp_flags |= pi->tcp_flags;
+        flags = pi->tcp_flags;
+    return account(t, &key, reversed, flags, wire_len, ts_ns);
+}
+
+int tunnel_key_from_packet(const struct packet_info *pi, struct flow_key *key)
+{
+    if (!pi->is_gtpu || !pi->gtp_v1u)
+        return 0;
+
+    memset(key, 0, sizeof *key);
+    key->teid = pi->teid;
+    key->ip_version = pi->ip_version;
+    key->proto = pi->ip_proto; /* always UDP */
+    memcpy(key->addr_a, pi->src_addr, sizeof key->addr_a);
+    memcpy(key->addr_b, pi->dst_addr, sizeof key->addr_b);
+    return 1;
+}
+
+int flow_table_add_tunnel(struct flow_table *t, const struct packet_info *pi,
+                          uint32_t wire_len, uint64_t ts_ns)
+{
+    struct flow_key key;
+
+    if (!tunnel_key_from_packet(pi, &key))
+        return 0;
+    return account(t, &key, 0, 0, wire_len, ts_ns);
+}
+
+static int teid_cmp(const void *pa, const void *pb)
+{
+    uint32_t a = *(const uint32_t *)pa, b = *(const uint32_t *)pb;
+
+    return (a > b) - (a < b);
+}
+
+int flow_table_distinct_teids(const struct flow_table *t, size_t *count)
+{
+    uint32_t *teids;
+    const struct flow *f;
+    size_t n = 0, pos = 0, i;
+
+    *count = 0;
+    if (t->count == 0)
+        return 0;
+    teids = malloc(t->count * sizeof *teids); /* count < capacity: no overflow */
+    if (teids == NULL)
+        return -1;
+    while ((f = flow_table_next(t, &pos)) != NULL)
+        teids[n++] = f->key.teid;
+    /* Sorted, equal TEIDs are adjacent: count the first of each run. */
+    qsort(teids, n, sizeof *teids, teid_cmp);
+    for (i = 0; i < n; i++) {
+        if (i == 0 || teids[i] != teids[i - 1])
+            (*count)++;
+    }
+    free(teids);
     return 0;
 }
 

@@ -243,3 +243,129 @@ int report_csv(FILE *out, const struct flow_table *t)
     free(all);
     return ferror(out) ? -1 : 0;
 }
+
+int report_gtpu(FILE *out, const struct stats *s,
+                const struct flow_table *tunnels)
+{
+    const struct gtpu_stats *g = &s->gtpu;
+    size_t teids, i;
+
+    if (g->packets == 0 && g->fragmented == 0)
+        return 0;
+    if (flow_table_distinct_teids(tunnels, &teids) != 0)
+        return -1;
+
+    fprintf(out, "\nGTP-U:       %" PRIu64 " packets on UDP port %u\n",
+            g->packets, GTPU_PORT);
+    fprintf(out, "  Messages:  G-PDU %" PRIu64 ", echo request %" PRIu64
+                 ", echo response %" PRIu64 ", error indication %" PRIu64
+                 ", end marker %" PRIu64 ", other %" PRIu64 "\n",
+            g->gpdu, g->echo_request, g->echo_response, g->error_indication,
+            g->end_marker, g->other_type);
+    fprintf(out, "  Options:   sequence number in %" PRIu64
+                 ", extension headers in %" PRIu64 "\n",
+            g->with_seq, g->with_ext);
+    fprintf(out, "  Inner IP:  IPv4 %" PRIu64 ", IPv6 %" PRIu64 "; TCP %"
+                 PRIu64 ", UDP %" PRIu64 ", ICMP %" PRIu64 ", ICMPv6 %"
+                 PRIu64 ", other %" PRIu64 "\n",
+            g->inner_ipv4, g->inner_ipv6, g->inner_tcp, g->inner_udp,
+            g->inner_icmp, g->inner_icmpv6, g->inner_other);
+    fprintf(out, "  Tunnels:   %zu (%zu distinct TEIDs)\n", tunnels->count,
+            teids);
+    fprintf(out, "  Skipped:   %" PRIu64 " GTP' or other version, %" PRIu64
+                 " GTP-U in GTP-U, %" PRIu64 " IP fragments on port %u\n",
+            g->not_v1u, g->nested, g->fragmented, GTPU_PORT);
+    fprintf(out, "  Problems:  %" PRIu64 " truncated, %" PRIu64
+                 " malformed (excluded from tunnels)\n",
+            g->truncated, g->malformed);
+    for (i = 1; i < DEC_STATUS_COUNT; i++) {
+        if (g->by_status[i] > 0)
+            fprintf(out, "    %-38s %" PRIu64 "\n",
+                    decode_status_str((enum decode_status)i), g->by_status[i]);
+    }
+    return 0;
+}
+
+/* A tunnel's endpoints are addresses only: GTP-U always uses UDP port 2152
+ * at the receiver, and a tunnel key has no ports. */
+static void tunnel_endpoints(const struct flow *f, char *src, char *dst,
+                             size_t len)
+{
+    addr_format(f->key.ip_version, f->key.addr_a, src, len);
+    addr_format(f->key.ip_version, f->key.addr_b, dst, len);
+}
+
+void report_top_tunnels(FILE *out, const struct flow *const *top, size_t n,
+                        size_t tunnel_count)
+{
+    char src[ADDR_STR_LEN], dst[ADDR_STR_LEN];
+    int src_w = 3, dst_w = 3;
+    size_t i;
+
+    if (n == 0)
+        return;
+    for (i = 0; i < n; i++) {
+        int ls, ld;
+
+        tunnel_endpoints(top[i], src, dst, sizeof src);
+        ls = (int)strlen(src);
+        ld = (int)strlen(dst);
+        if (ls > src_w)
+            src_w = ls;
+        if (ld > dst_w)
+            dst_w = ld;
+    }
+
+    fprintf(out, "\nTop %zu of %zu GTP-U tunnels by bytes "
+                 "(one direction each; the receiver chose the TEID):\n",
+            n, tunnel_count);
+    fprintf(out, "%3s  %-10s  %-*s  %-*s  %8s  %10s  %12s\n", "#", "teid",
+            src_w, "src", dst_w, "dst", "packets", "bytes", "duration");
+    for (i = 0; i < n; i++) {
+        const struct flow *f = top[i];
+        uint64_t d = f->last_ts_ns - f->first_ts_ns;
+        char dur[32];
+
+        tunnel_endpoints(f, src, dst, sizeof src);
+        snprintf(dur, sizeof dur, "%" PRIu64 ".%03u s", d / NS_PER_SEC,
+                 (unsigned)(d % NS_PER_SEC / 1000000u));
+        fprintf(out, "%3zu  0x%08" PRIx32 "  %-*s  %-*s  %8" PRIu64
+                     "  %10" PRIu64 "  %12s\n",
+                i + 1, f->key.teid, src_w, src, dst_w, dst, f->packets,
+                f->bytes, dur);
+    }
+}
+
+int report_tunnels_csv(FILE *out, const struct flow_table *t)
+{
+    const struct flow **all = NULL;
+    size_t n = 0, i;
+
+    if (t->count > 0) {
+        all = malloc(t->count * sizeof *all); /* count < capacity: no overflow */
+        if (all == NULL)
+            return -1;
+        n = flow_table_top_n(t, t->count, all);
+    }
+
+    fprintf(out, "teid,src_addr,dst_addr,ip_version,packets,bytes,"
+                 "first_ts,last_ts,duration_s\n");
+    for (i = 0; i < n; i++) {
+        const struct flow *f = all[i];
+        char src[ADDR_STR_LEN], dst[ADDR_STR_LEN];
+        uint64_t d = f->last_ts_ns - f->first_ts_ns;
+
+        tunnel_endpoints(f, src, dst, sizeof src);
+        fprintf(out, "0x%08" PRIx32 ",%s,%s,%u,%" PRIu64 ",%" PRIu64
+                     ",%" PRIu64 ".%09u,%" PRIu64 ".%09u,%" PRIu64 ".%09u\n",
+                f->key.teid, src, dst, (unsigned)f->key.ip_version,
+                f->packets, f->bytes,
+                f->first_ts_ns / NS_PER_SEC,
+                (unsigned)(f->first_ts_ns % NS_PER_SEC),
+                f->last_ts_ns / NS_PER_SEC,
+                (unsigned)(f->last_ts_ns % NS_PER_SEC),
+                d / NS_PER_SEC, (unsigned)(d % NS_PER_SEC));
+    }
+    free(all);
+    return ferror(out) ? -1 : 0;
+}

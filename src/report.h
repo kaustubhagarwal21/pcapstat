@@ -38,4 +38,18 @@ void report_top_flows(FILE *out, const struct flow *const *top, size_t n,
  * -1 on allocation or write failure. */
 int report_csv(FILE *out, const struct flow_table *t);
 
+/* The GTP-U part of the summary. Prints nothing if the capture held no
+ * GTP-U. Returns 0, or -1 if out of memory. */
+int report_gtpu(FILE *out, const struct stats *s,
+                const struct flow_table *tunnels);
+
+/* The largest GTP-U tunnels, as selected by flow_table_top_n() on the
+ * tunnel table. */
+void report_top_tunnels(FILE *out, const struct flow *const *top, size_t n,
+                        size_t tunnel_count);
+
+/* Write every tunnel, largest first, with a header row. Returns 0 on
+ * success, -1 on allocation or write failure. */
+int report_tunnels_csv(FILE *out, const struct flow_table *t);
+
 #endif /* PCAPSTAT_REPORT_H */

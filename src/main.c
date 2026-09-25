@@ -1,7 +1,7 @@
 /*
  * main.c - pcapstat command-line interface.
  *
- *   pcapstat [-n N] [--csv FILE] FILE.pcap
+ *   pcapstat [-n N] [--csv FILE] [--tunnels-csv FILE] FILE.pcap
  *
  * Exit status: 0 success, 1 usage error, 2 input error (unreadable, not a
  * pcap file, truncated, or a CSV write failure). When a capture turns out to
@@ -26,16 +26,18 @@
 static void usage(FILE *out)
 {
     fprintf(out,
-            "usage: pcapstat [-n N] [--csv FILE] FILE.pcap\n"
+            "usage: pcapstat [-n N] [--csv FILE] [--tunnels-csv FILE] "
+            "FILE.pcap\n"
             "\n"
             "Summarise a classic libpcap capture (Ethernet link type):\n"
-            "packet counts per protocol, decode problems, and the largest\n"
-            "bidirectional flows.\n"
+            "packet counts per protocol, decode problems, the largest\n"
+            "bidirectional flows and, for GTP-U traffic, the largest tunnels.\n"
             "\n"
-            "  -n N        show the top N flows by bytes (default %u, 0 hides\n"
-            "              the table)\n"
-            "  --csv FILE  also write every flow to FILE as CSV\n"
-            "  -h, --help  show this help\n"
+            "  -n N                show the top N flows and tunnels by bytes\n"
+            "                      (default %u, 0 hides the tables)\n"
+            "  --csv FILE          also write every flow to FILE as CSV\n"
+            "  --tunnels-csv FILE  also write every GTP-U tunnel to FILE as CSV\n"
+            "  -h, --help          show this help\n"
             "\n"
             "exit status: 0 ok, 1 usage error, 2 input error\n",
             DEFAULT_TOP_N);
@@ -63,7 +65,8 @@ static int parse_count(const char *text, size_t *out)
     return 1;
 }
 
-static int write_csv(const char *path, const struct flow_table *flows)
+static int write_csv(const char *path, const struct flow_table *t,
+                     int (*writer)(FILE *, const struct flow_table *))
 {
     FILE *f = fopen(path, "w");
     int rc;
@@ -72,7 +75,7 @@ static int write_csv(const char *path, const struct flow_table *flows)
         fprintf(stderr, "pcapstat: %s: %s\n", path, strerror(errno));
         return -1;
     }
-    rc = report_csv(f, flows);
+    rc = writer(f, t);
     /* fclose flushes buffered output, so a full disk may only show up here. */
     if (fclose(f) != 0)
         rc = -1;
@@ -81,14 +84,36 @@ static int write_csv(const char *path, const struct flow_table *flows)
     return rc;
 }
 
+/* Print the top `top_n` entries of a flow or tunnel table. Returns 0, or -1
+ * if out of memory. */
+static int print_top(const struct flow_table *t, size_t top_n, int tunnels)
+{
+    const struct flow **top;
+    size_t n = top_n < t->count ? top_n : t->count;
+
+    if (n == 0)
+        return 0;
+    top = malloc(n * sizeof *top); /* n <= MAX_TOP_N: cannot overflow */
+    if (top == NULL) {
+        fprintf(stderr, "pcapstat: out of memory\n");
+        return -1;
+    }
+    n = flow_table_top_n(t, n, top);
+    if (tunnels)
+        report_top_tunnels(stdout, top, n, t->count);
+    else
+        report_top_flows(stdout, top, n, t->count);
+    free(top);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    size_t top_n = DEFAULT_TOP_N, n;
-    const char *csv_path = NULL, *pcap_path = NULL;
+    size_t top_n = DEFAULT_TOP_N;
+    const char *csv_path = NULL, *tunnels_path = NULL, *pcap_path = NULL;
     struct pcap_reader reader;
     struct analysis an;
     enum pcap_status st;
-    const struct flow **top = NULL;
     int status = EXIT_OK, i;
 
     for (i = 1; i < argc; i++) {
@@ -104,12 +129,16 @@ int main(int argc, char **argv)
                 return EXIT_USAGE;
             }
             i++;
-        } else if (strcmp(arg, "--csv") == 0) {
+        } else if (strcmp(arg, "--csv") == 0 ||
+                   strcmp(arg, "--tunnels-csv") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "pcapstat: --csv needs a file name\n");
+                fprintf(stderr, "pcapstat: %s needs a file name\n", arg);
                 return EXIT_USAGE;
             }
-            csv_path = argv[++i];
+            if (strcmp(arg, "--csv") == 0)
+                csv_path = argv[++i];
+            else
+                tunnels_path = argv[++i];
         } else if (arg[0] == '-' && arg[1] != '\0') {
             fprintf(stderr, "pcapstat: unknown option '%s'\n", arg);
             usage(stderr);
@@ -128,8 +157,15 @@ int main(int argc, char **argv)
     /* `--csv cap.pcap cap.pcap` would overwrite the capture with the CSV.
      * Comparing names catches that slip; a different spelling of the same
      * path (./cap.pcap) is not caught, which would need POSIX stat(). */
-    if (csv_path != NULL && strcmp(csv_path, pcap_path) == 0) {
-        fprintf(stderr, "pcapstat: --csv file must not be the input file\n");
+    if ((csv_path != NULL && strcmp(csv_path, pcap_path) == 0) ||
+        (tunnels_path != NULL && strcmp(tunnels_path, pcap_path) == 0)) {
+        fprintf(stderr, "pcapstat: a CSV file must not be the input file\n");
+        return EXIT_USAGE;
+    }
+    if (csv_path != NULL && tunnels_path != NULL &&
+        strcmp(csv_path, tunnels_path) == 0) {
+        fprintf(stderr, "pcapstat: --csv and --tunnels-csv need different "
+                        "files\n");
         return EXIT_USAGE;
     }
 
@@ -162,26 +198,24 @@ int main(int argc, char **argv)
 
     report_summary(stdout, pcap_path, &reader.info, &an.stats,
                    an.flows.count);
-
-    n = top_n < an.flows.count ? top_n : an.flows.count;
-    if (n > 0) {
-        top = malloc(n * sizeof *top); /* n <= MAX_TOP_N: cannot overflow */
-        if (top == NULL) {
-            fprintf(stderr, "pcapstat: out of memory\n");
-            status = EXIT_INPUT;
-        } else {
-            n = flow_table_top_n(&an.flows, n, top);
-            report_top_flows(stdout, top, n, an.flows.count);
-        }
+    if (print_top(&an.flows, top_n, 0) != 0)
+        status = EXIT_INPUT;
+    if (report_gtpu(stdout, &an.stats, &an.tunnels) != 0) {
+        fprintf(stderr, "pcapstat: out of memory\n");
+        status = EXIT_INPUT;
     }
+    if (print_top(&an.tunnels, top_n, 1) != 0)
+        status = EXIT_INPUT;
 
-    if (csv_path != NULL && write_csv(csv_path, &an.flows) != 0)
+    if (csv_path != NULL && write_csv(csv_path, &an.flows, report_csv) != 0)
+        status = EXIT_INPUT;
+    if (tunnels_path != NULL &&
+        write_csv(tunnels_path, &an.tunnels, report_tunnels_csv) != 0)
         status = EXIT_INPUT;
 
     if (fflush(stdout) != 0)
         status = EXIT_INPUT;
 
-    free(top);
     analysis_free(&an);
     pcap_close(&reader);
     return status;

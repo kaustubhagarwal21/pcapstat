@@ -1,5 +1,6 @@
 /*
- * decode.c - Ethernet / VLAN / IPv4 / IPv6 / TCP / UDP / ICMP decoder.
+ * decode.c - Ethernet / VLAN / IPv4 / IPv6 / TCP / UDP / ICMP / GTP-U
+ * decoder.
  *
  * The central idea is the `span`: a view of the bytes that remain at the
  * current layer, carrying two lengths.
@@ -22,6 +23,11 @@
  * captured in full (caplen == wire length) keeps cap == wire at every layer
  * and can never be reported as truncated: if it is too short for a header,
  * the frame itself is at fault, and that is malformed.
+ *
+ * GTP-U follows the same rules one level down: the UDP length bounds the
+ * GTP-U message, the GTP-U length bounds what follows its header, and the
+ * user IP packet inside a G-PDU is decoded by the same IPv4/IPv6 code as
+ * the outer packet, inside that span.
  */
 #include "decode.h"
 
@@ -37,6 +43,8 @@
 #define TCP_MIN_HDR     20u
 #define UDP_HDR_LEN      8u
 #define ICMP_MIN_HDR     4u  /* type, code, checksum */
+#define GTPU_HDR_LEN     8u  /* flags, type, length, TEID */
+#define GTPU_OPT_LEN     4u  /* sequence number, N-PDU number, next type */
 
 /* IPv6 extension headers we step over to find the upper-layer protocol. */
 #define IP6_EXT_HOPOPTS   0u
@@ -122,6 +130,11 @@ static enum decode_status decode_l4(struct span *s, struct packet_info *pi)
         ulen = load_be16(s->p + 4);
         if (ulen < UDP_HDR_LEN || (pi->frag == FRAG_NONE && ulen > s->wire))
             return DEC_BAD_UDP_LEN;
+        /* In an unfragmented packet the UDP length is the datagram's real
+         * size, so from here on the span covers exactly the datagram. That
+         * matters for GTP-U, the one UDP payload that is decoded. */
+        if (pi->frag == FRAG_NONE)
+            clip(s, ulen);
         pi->has_l4 = 1;
         return DEC_OK;
     }
@@ -285,6 +298,149 @@ static enum decode_status decode_ipv6(struct span *s, struct packet_info *pi)
     return decode_l4(s, pi);
 }
 
+int decode_is_gtpu_port(const struct packet_info *pi)
+{
+    return pi->has_l4 && pi->ip_proto == IPPROTO_NUM_UDP &&
+           (pi->src_port == GTPU_PORT || pi->dst_port == GTPU_PORT);
+}
+
+/*
+ * The payload of a G-PDU (the "T-PDU") is one user IP packet. No ethertype
+ * precedes it, so its version nibble says which IP version it is. It goes
+ * through the same decoders as the outer packet, into a scratch
+ * packet_info, and the fields that describe it are copied out.
+ */
+static enum decode_status decode_gtpu_inner(struct span *s,
+                                            struct packet_info *pi)
+{
+    struct packet_info in;
+    enum decode_status st;
+
+    st = need(s, 1, DEC_TRUNC_GTPU_INNER, DEC_BAD_GTPU_INNER);
+    if (st != DEC_OK)
+        return st;
+    memset(&in, 0, sizeof in);
+    switch (s->p[0] >> 4) {
+    case 4:
+        st = decode_ipv4(s, &in);
+        break;
+    case 6:
+        st = decode_ipv6(s, &in);
+        break;
+    default:
+        return DEC_BAD_GTPU_INNER;
+    }
+
+    /* Keep whatever was valid, even if decoding failed further in: an
+     * inner packet with a good IP header and a bad TCP header still has
+     * known addresses, as the outer packet would. */
+    if (in.has_l3) {
+        pi->has_inner = 1;
+        pi->inner_version = in.ip_version;
+        pi->inner_proto = in.ip_proto;
+        memcpy(pi->inner_src, in.src_addr, sizeof pi->inner_src);
+        memcpy(pi->inner_dst, in.dst_addr, sizeof pi->inner_dst);
+    }
+    if (in.has_l4) {
+        pi->inner_has_l4 = 1;
+        pi->inner_src_port = in.src_port;
+        pi->inner_dst_port = in.dst_port;
+        /* GTP-U inside GTP-U is only flagged. decode_l4() never calls
+         * decode_gtpu(), so this cannot recurse however deep a crafted
+         * packet nests. */
+        pi->gtp_nested = (uint8_t)decode_is_gtpu_port(&in);
+    }
+    return st;
+}
+
+/*
+ * GTPv1-U (3GPP TS 29.281 section 5.1). `s` covers the UDP payload, which
+ * the caller checked is at least 8 bytes on the wire.
+ *
+ *   byte 0     version (3 bits) | PT | spare | E | S | PN
+ *   byte 1     message type
+ *   bytes 2-3  length: the bytes after these first 8 (optional fields,
+ *              extension headers and payload)
+ *   bytes 4-7  TEID, the tunnel endpoint identifier chosen by the receiver
+ *
+ * If any of E, S or PN is set, 4 more bytes follow: sequence number (2),
+ * N-PDU number (1) and the type of the first extension header (1). Each
+ * extension header (section 5.2) starts with its length in 4-byte units
+ * and ends with the type of the next one; type 0 ends the chain.
+ */
+static enum decode_status decode_gtpu(struct span *s, struct packet_info *pi)
+{
+    unsigned flags, next = 0, hops = 0;
+    size_t len;
+    enum decode_status st;
+
+    /* wire >= 8 is known, so only the capture can cut the header short. */
+    st = need(s, GTPU_HDR_LEN, DEC_TRUNC_GTPU, DEC_BAD_GTPU_LEN);
+    if (st != DEC_OK)
+        return st;
+
+    /* PT 0 is GTP' (charging data) and version 2 is GTP-C. Neither is
+     * GTP-U, so the packet is counted but not decoded further. */
+    flags = s->p[0];
+    if ((flags >> 5) != 1 || !(flags & GTPU_FLAG_PT))
+        return DEC_OK;
+    pi->gtp_v1u = 1;
+    pi->gtp_flags = (uint8_t)flags;
+    pi->gtp_msg_type = s->p[1];
+    len = load_be16(s->p + 2);
+    pi->teid = load_be32(s->p + 4);
+
+    /* The length may not claim more than the UDP datagram holds. Like
+     * every length from the packet, it can only shrink the span. */
+    if (len > s->wire - GTPU_HDR_LEN)
+        return DEC_BAD_GTPU_LEN;
+    advance(s, GTPU_HDR_LEN);
+    clip(s, len);
+
+    /* If the length is too small for the optional fields that the flags
+     * announce, need() finds wire < 4 and reports it as malformed. */
+    if (flags & (GTPU_FLAG_E | GTPU_FLAG_S | GTPU_FLAG_PN)) {
+        st = need(s, GTPU_OPT_LEN, DEC_TRUNC_GTPU, DEC_BAD_GTPU_LEN);
+        if (st != DEC_OK)
+            return st;
+        if (flags & GTPU_FLAG_S)
+            pi->gtp_seq = load_be16(s->p);
+        /* With E clear, the next-type byte "shall not be interpreted". */
+        if (flags & GTPU_FLAG_E)
+            next = s->p[3];
+        advance(s, GTPU_OPT_LEN);
+    }
+
+    while (next != 0) {
+        size_t elen;
+
+        if (hops++ == GTPU_MAX_EXT_HEADERS)
+            return DEC_BAD_GTPU_EXT;
+        st = need(s, 1, DEC_TRUNC_GTPU_EXT, DEC_BAD_GTPU_EXT);
+        if (st != DEC_OK)
+            return st;
+        /* The length counts the whole header, including this byte and the
+         * next-type byte, so 0 is impossible, and accepting it would let
+         * the walk stand still. */
+        elen = (size_t)s->p[0] * 4;
+        if (elen == 0)
+            return DEC_BAD_GTPU_EXT_LEN;
+        st = need(s, elen, DEC_TRUNC_GTPU_EXT, DEC_BAD_GTPU_EXT);
+        if (st != DEC_OK)
+            return st;
+        next = s->p[elen - 1];
+        advance(s, elen);
+        pi->gtp_ext_count = (uint8_t)hops;
+    }
+
+    /* Echo, error indication, end marker and the other signalling messages
+     * carry information elements, not user data. They are counted by type;
+     * their contents are not decoded. */
+    if (pi->gtp_msg_type != GTPU_MSG_GPDU)
+        return DEC_OK;
+    return decode_gtpu_inner(s, pi);
+}
+
 enum decode_status decode_frame(const uint8_t *frame, size_t caplen,
                                 size_t wirelen, struct packet_info *pi)
 {
@@ -331,12 +487,24 @@ enum decode_status decode_frame(const uint8_t *frame, size_t caplen,
         pi->status = DEC_OK; /* ARP, LLDP, ...: valid, just not IP */
         break;
     }
+
+    /* GTP-U rides on UDP, so it is decoded here, once the outer packet has
+     * decoded cleanly. The IP decoders have stepped over the IP headers and
+     * decode_l4() clipped the span to the UDP length, so `s` now covers
+     * exactly the UDP datagram. A first IP fragment holds only part of the
+     * datagram, so it is not decoded (there is no reassembly). */
+    if (pi->status == DEC_OK && pi->frag == FRAG_NONE &&
+        decode_is_gtpu_port(pi) && s.wire >= UDP_HDR_LEN + GTPU_HDR_LEN) {
+        pi->is_gtpu = 1;
+        advance(&s, UDP_HDR_LEN);
+        pi->gtp_status = decode_gtpu(&s, pi);
+    }
     return pi->status;
 }
 
 int decode_status_is_truncation(enum decode_status s)
 {
-    return s >= DEC_TRUNC_ETHERNET && s <= DEC_TRUNC_ICMP;
+    return s >= DEC_TRUNC_ETHERNET && s <= DEC_TRUNC_GTPU_INNER;
 }
 
 const char *decode_status_str(enum decode_status s)
@@ -351,6 +519,9 @@ const char *decode_status_str(enum decode_status s)
     case DEC_TRUNC_TCP:            return "truncated TCP header";
     case DEC_TRUNC_UDP:            return "truncated UDP header";
     case DEC_TRUNC_ICMP:           return "truncated ICMP header";
+    case DEC_TRUNC_GTPU:           return "truncated GTP-U header";
+    case DEC_TRUNC_GTPU_EXT:       return "truncated GTP-U extension header";
+    case DEC_TRUNC_GTPU_INNER:     return "G-PDU truncated before its IP packet";
     case DEC_BAD_SHORT_FRAME:      return "frame too short for its headers";
     case DEC_BAD_VLAN_DEPTH:       return "more than 2 VLAN tags";
     case DEC_BAD_IPV4_VERSION:     return "IPv4 ethertype with wrong IP version";
@@ -362,6 +533,10 @@ const char *decode_status_str(enum decode_status s)
     case DEC_BAD_L4_LEN:           return "IP payload too short for L4 header";
     case DEC_BAD_TCP_DOFF:         return "TCP data offset invalid";
     case DEC_BAD_UDP_LEN:          return "UDP length invalid";
+    case DEC_BAD_GTPU_LEN:         return "GTP-U length invalid";
+    case DEC_BAD_GTPU_EXT_LEN:     return "GTP-U extension header length 0";
+    case DEC_BAD_GTPU_EXT:         return "GTP-U extension header invalid";
+    case DEC_BAD_GTPU_INNER:       return "G-PDU payload not IPv4 or IPv6";
     case DEC_STATUS_COUNT:         break;
     }
     return "unknown";

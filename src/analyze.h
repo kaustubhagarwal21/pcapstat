@@ -12,7 +12,8 @@
 
 struct analysis {
     struct stats stats;
-    struct flow_table flows;
+    struct flow_table flows;   /* outer 5-tuple flows */
+    struct flow_table tunnels; /* GTP-U tunnels (see flow.h) */
     struct frag_cache frags;
 };
 
@@ -21,9 +22,10 @@ int analysis_init(struct analysis *a);
 
 /*
  * Account one decoded packet: attribute it if it is a later fragment,
- * update the global counters and, if it decoded cleanly, its flow. `pi` may
- * be modified (a later fragment can receive its datagram's ports). Returns
- * 0, or -1 if the flow table could not grow.
+ * update the global counters and, if it decoded cleanly, its flow and, for
+ * a cleanly decoded G-PDU, its GTP-U tunnel. `pi` may be modified (a later
+ * fragment can receive its datagram's ports). Returns 0, or -1 if a table
+ * could not grow.
  */
 int analysis_account(struct analysis *a, struct packet_info *pi,
                      uint32_t caplen, uint32_t wirelen, uint64_t ts_ns);

@@ -35,11 +35,35 @@
 #define TCP_ECE 0x40u
 #define TCP_CWR 0x80u
 
+/* GTP-U, the GPRS Tunnelling Protocol for user data (3GPP TS 29.281). */
+#define GTPU_PORT 2152u
+
+/* First header byte: version (3 bits), PT, a spare bit, then E, S, PN. */
+#define GTPU_FLAG_PT 0x10u /* protocol type: 1 = GTP, 0 = GTP' (charging) */
+#define GTPU_FLAG_E  0x04u /* an extension header follows */
+#define GTPU_FLAG_S  0x02u /* the sequence number field is meaningful */
+#define GTPU_FLAG_PN 0x01u /* the N-PDU number field is meaningful */
+
+#define GTPU_MSG_ECHO_REQUEST     1u
+#define GTPU_MSG_ECHO_RESPONSE    2u
+#define GTPU_MSG_ERROR_INDICATION 26u
+#define GTPU_MSG_END_MARKER       254u
+#define GTPU_MSG_GPDU             255u /* carries one user IP packet */
+
+/* Real packets carry one or two extension headers. The bound keeps a
+ * crafted chain from making the loop run long. */
+#define GTPU_MAX_EXT_HEADERS 16u
+
 /*
  * Why a frame could not be fully decoded. "Truncated" means the capture
  * stopped before a header ended (a small snapshot length, or a damaged
  * file); the packet itself may have been fine. "Malformed" means a header
  * field is impossible: it contradicts itself or the size of the frame.
+ *
+ * The same values describe the outer packet (packet_info.status) and a
+ * GTP-U message with the user packet inside it (packet_info.gtp_status).
+ * All the truncation values come first: decode_status_is_truncation()
+ * tests that range.
  */
 enum decode_status {
     DEC_OK = 0,
@@ -52,6 +76,9 @@ enum decode_status {
     DEC_TRUNC_TCP,
     DEC_TRUNC_UDP,
     DEC_TRUNC_ICMP,
+    DEC_TRUNC_GTPU,           /* inside the GTP-U header or its optional fields */
+    DEC_TRUNC_GTPU_EXT,       /* inside a GTP-U extension header */
+    DEC_TRUNC_GTPU_INNER,     /* before the first byte of a G-PDU's user packet */
 
     DEC_BAD_SHORT_FRAME,      /* whole frame shorter than a fixed-size header */
     DEC_BAD_VLAN_DEPTH,       /* more than DECODE_MAX_VLANS tags */
@@ -64,6 +91,12 @@ enum decode_status {
     DEC_BAD_L4_LEN,           /* IP payload too short for the L4 header */
     DEC_BAD_TCP_DOFF,         /* TCP data offset < 5 or beyond the IP payload */
     DEC_BAD_UDP_LEN,          /* UDP length < 8 or beyond the IP payload */
+    DEC_BAD_GTPU_LEN,         /* GTP-U length > UDP payload, or too short for
+                                 the optional fields the flags announce */
+    DEC_BAD_GTPU_EXT_LEN,     /* extension header with length 0 */
+    DEC_BAD_GTPU_EXT,         /* extension header overruns the message, or
+                                 more than GTPU_MAX_EXT_HEADERS of them */
+    DEC_BAD_GTPU_INNER,       /* G-PDU payload empty or not IPv4/IPv6 */
 
     DEC_STATUS_COUNT
 };
@@ -105,6 +138,36 @@ struct packet_info {
     uint8_t tcp_flags;                  /* TCP_* bits */
     uint8_t icmp_type;                  /* ICMP and ICMPv6 */
     uint8_t icmp_code;
+
+    /* GTP-U. is_gtpu is set for a cleanly decoded, unfragmented UDP
+     * datagram to or from port 2152 with at least 8 bytes of payload; the
+     * GTP-U decoder then ran on that payload, and gtp_status says how far
+     * it got. The fields above always describe the outer packet, and
+     * pi->status is not changed by anything inside the tunnel. */
+    uint8_t is_gtpu;
+    enum decode_status gtp_status;      /* DEC_OK unless is_gtpu */
+    uint8_t gtp_v1u;                    /* header read and it is GTPv1-U
+                                           (version 1, PT 1); only then are
+                                           the GTP fields below set */
+    uint8_t gtp_flags;                  /* first header byte: version, PT,
+                                           E, S, PN (GTPU_FLAG_*) */
+    uint8_t gtp_msg_type;               /* GTPU_MSG_* */
+    uint16_t gtp_seq;                   /* valid when GTPU_FLAG_S is set */
+    uint32_t teid;                      /* tunnel endpoint identifier */
+    uint8_t gtp_ext_count;              /* extension headers walked */
+
+    /* The user packet inside a G-PDU, decoded by the same IPv4/IPv6/L4
+     * code as the outer packet. has_inner means its IP header was valid. */
+    uint8_t has_inner;
+    uint8_t inner_has_l4;
+    uint8_t gtp_nested;                 /* the user packet is UDP port 2152
+                                           again: counted, never decoded */
+    uint8_t inner_version;              /* 4 or 6 */
+    uint8_t inner_proto;                /* 0 if its IPv6 chain is broken */
+    uint8_t inner_src[16];              /* IPv4 uses the first 4 bytes */
+    uint8_t inner_dst[16];
+    uint16_t inner_src_port;            /* TCP/UDP, when inner_has_l4 */
+    uint16_t inner_dst_port;
 };
 
 /*
@@ -115,6 +178,10 @@ struct packet_info {
  */
 enum decode_status decode_frame(const uint8_t *frame, size_t caplen,
                                 size_t wirelen, struct packet_info *pi);
+
+/* 1 if the packet has a decoded UDP header with port 2152 on either side
+ * (whether or not it was decoded as GTP-U: a first IP fragment is not). */
+int decode_is_gtpu_port(const struct packet_info *pi);
 
 const char *decode_status_str(enum decode_status s);
 int decode_status_is_truncation(enum decode_status s);

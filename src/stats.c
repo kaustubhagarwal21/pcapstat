@@ -22,11 +22,18 @@ static void add_gtpu(struct gtpu_stats *g, const struct packet_info *pi)
 
     if ((unsigned)pi->gtp_status < DEC_STATUS_COUNT)
         g->by_status[pi->gtp_status]++;
+    /* A problem found after the GTP-U headers were read in full can only
+     * be in a G-PDU's user packet. */
     if (pi->gtp_status != DEC_OK) {
-        if (decode_status_is_truncation(pi->gtp_status))
+        if (decode_status_is_truncation(pi->gtp_status)) {
             g->truncated++;
-        else
+            if (pi->gtp_msg_ok)
+                g->user_truncated++;
+        } else {
             g->malformed++;
+            if (pi->gtp_msg_ok)
+                g->user_malformed++;
+        }
     }
 
     /* A header cut off by the capture is a problem, counted above. A whole

@@ -273,11 +273,17 @@ int report_gtpu(FILE *out, const struct stats *s,
     fprintf(out, "  Tunnels:   %zu (%zu distinct TEIDs)\n", tunnels->count,
             teids);
     fprintf(out, "  Skipped:   %" PRIu64 " GTP' or other version, %" PRIu64
-                 " GTP-U in GTP-U, %" PRIu64 " IP fragments on port %u\n",
-            g->not_v1u, g->nested, g->fragmented, GTPU_PORT);
+                 " GTP-U in GTP-U, %" PRIu64 " fragmented datagrams on port "
+                 "%u\n", g->not_v1u, g->nested, g->fragmented, GTPU_PORT);
+    /* The user_* counters are subsets of the totals (stats.c raises both
+     * together), so the subtractions cannot wrap. */
     fprintf(out, "  Problems:  %" PRIu64 " truncated, %" PRIu64
-                 " malformed (excluded from tunnels)\n",
-            g->truncated, g->malformed);
+                 " malformed in GTP-U headers (not added to tunnels)\n",
+            g->truncated - g->user_truncated,
+            g->malformed - g->user_malformed);
+    fprintf(out, "             %" PRIu64 " truncated, %" PRIu64
+                 " malformed in user packets (still added to tunnels)\n",
+            g->user_truncated, g->user_malformed);
     for (i = 1; i < DEC_STATUS_COUNT; i++) {
         if (g->by_status[i] > 0)
             fprintf(out, "    %-38s %" PRIu64 "\n",

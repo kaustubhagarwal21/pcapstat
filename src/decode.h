@@ -97,6 +97,8 @@ enum decode_status {
     DEC_BAD_GTPU_EXT,         /* extension header overruns the message, or
                                  more than GTPU_MAX_EXT_HEADERS of them */
     DEC_BAD_GTPU_INNER,       /* G-PDU payload empty or not IPv4/IPv6 */
+    DEC_BAD_GTPU_INNER_SHORT, /* G-PDU payload shorter than the fixed IPv4
+                                 or IPv6 header it starts */
 
     DEC_STATUS_COUNT
 };
@@ -152,6 +154,12 @@ struct packet_info {
     uint8_t gtp_flags;                  /* first header byte: version, PT,
                                            E, S, PN (GTPU_FLAG_*) */
     uint8_t gtp_msg_type;               /* GTPU_MSG_* */
+    uint8_t gtp_msg_ok;                 /* the GTP-U headers (header,
+                                           optional fields, extension
+                                           headers) were read in full and
+                                           are consistent. A G-PDU's user
+                                           packet may still have failed:
+                                           gtp_status then says why */
     uint16_t gtp_seq;                   /* valid when GTPU_FLAG_S is set */
     uint32_t teid;                      /* tunnel endpoint identifier */
     uint8_t gtp_ext_count;              /* extension headers walked */

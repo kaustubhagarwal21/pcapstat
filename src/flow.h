@@ -90,8 +90,9 @@ int tunnel_key_from_packet(const struct packet_info *pi,
                            struct flow_key *key);
 
 /* Account one GTPv1-U packet in a table of tunnels; other packets are
- * ignored. The caller decides which messages count (pcapstat adds cleanly
- * decoded G-PDUs). Returns 0 on success, -1 if out of memory. */
+ * ignored. The caller decides which messages count (pcapstat adds G-PDUs
+ * whose GTP-U headers decoded cleanly). Returns 0 on success, -1 if out of
+ * memory. */
 int flow_table_add_tunnel(struct flow_table *t, const struct packet_info *pi,
                           uint32_t wire_len, uint64_t ts_ns);
 

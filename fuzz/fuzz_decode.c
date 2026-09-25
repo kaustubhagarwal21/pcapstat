@@ -13,7 +13,8 @@
  * It then decodes the same bytes again with random bytes after them, and
  * the two results must be identical: the decoder may not look past caplen.
  * The result goes through the same accounting as the real tool (fragment
- * cache, counters, flow and tunnel tables).
+ * cache, counters, flow and tunnel tables), and at the end the tunnel table
+ * must hold exactly the G-PDUs whose GTP-U headers decoded in full.
  *
  * Every fourth iteration also builds a small pcap file from mutated frames,
  * corrupts its record headers (caplen in particular) and file bytes, and
@@ -213,6 +214,15 @@ static void fail(const char *what, unsigned long long iter)
     exit(1);
 }
 
+/* The reasons that stop decode_gtpu() before it has read every GTP-U
+ * header of the message. Any other reason comes from the user packet. */
+static int is_gtpu_header_problem(enum decode_status s)
+{
+    return s == DEC_TRUNC_GTPU || s == DEC_TRUNC_GTPU_EXT ||
+           s == DEC_BAD_GTPU_LEN || s == DEC_BAD_GTPU_EXT_LEN ||
+           s == DEC_BAD_GTPU_EXT;
+}
+
 /* Properties that must hold for any input whatsoever. `complete` is set
  * when the frame was captured in full (caplen == wire length). */
 static void check_invariants(const struct packet_info *pi,
@@ -248,8 +258,23 @@ static void check_invariants(const struct packet_info *pi,
                         !decode_is_gtpu_port(pi)))
         fail("GTP-U decoded outside a clean UDP port 2152 datagram", iter);
     if (!pi->is_gtpu && (pi->gtp_status != DEC_OK || pi->gtp_v1u ||
-                         pi->has_inner))
+                         pi->gtp_msg_ok || pi->has_inner))
         fail("GTP-U fields set without GTP-U", iter);
+    /* gtp_msg_ok, which decides whether a G-PDU joins its tunnel, is set
+     * exactly when the GTP-U headers were read in full: for a GTPv1-U
+     * header, unless the reason for stopping is one of the GTP-U header
+     * problems. After that point only a G-PDU's user packet can fail. */
+    if (pi->gtp_msg_ok && !pi->gtp_v1u)
+        fail("GTP-U message complete without a GTPv1-U header", iter);
+    if (pi->gtp_v1u &&
+        pi->gtp_msg_ok != !is_gtpu_header_problem(pi->gtp_status))
+        fail("gtp_msg_ok disagrees with the GTP-U status", iter);
+    if (pi->gtp_msg_ok && pi->gtp_msg_type != GTPU_MSG_GPDU &&
+        pi->gtp_status != DEC_OK)
+        fail("problem reported past the headers of a signalling message",
+             iter);
+    if (pi->has_inner && !pi->gtp_msg_ok)
+        fail("inner packet decoded before the GTP-U headers were", iter);
     if (pi->has_inner && (!pi->gtp_v1u || pi->gtp_msg_type != GTPU_MSG_GPDU))
         fail("inner packet outside a G-PDU", iter);
     if (pi->has_inner && pi->inner_version != 4 && pi->inner_version != 6)
@@ -288,7 +313,8 @@ static int same_info(const struct packet_info *a, const struct packet_info *b)
            a->icmp_code == b->icmp_code &&
            a->is_gtpu == b->is_gtpu && a->gtp_status == b->gtp_status &&
            a->gtp_v1u == b->gtp_v1u && a->gtp_flags == b->gtp_flags &&
-           a->gtp_msg_type == b->gtp_msg_type && a->gtp_seq == b->gtp_seq &&
+           a->gtp_msg_type == b->gtp_msg_type &&
+           a->gtp_msg_ok == b->gtp_msg_ok && a->gtp_seq == b->gtp_seq &&
            a->teid == b->teid && a->gtp_ext_count == b->gtp_ext_count &&
            a->has_inner == b->has_inner &&
            a->inner_has_l4 == b->inner_has_l4 &&
@@ -491,6 +517,7 @@ struct totals {
     unsigned long long gtpu_frames;      /* frames decoded as GTP-U */
     unsigned long long gtpu_inner;       /* ... with a valid inner packet */
     unsigned long long gtpu_by_status[DEC_STATUS_COUNT];
+    unsigned long long tunnel_gpdus;     /* G-PDUs that should be in a tunnel */
     unsigned long long files;
     unsigned long long file_records;
     unsigned long long file_outcome[PCAP_ERR_BAD_CAPLEN + 1];
@@ -512,17 +539,30 @@ static enum decode_status decode_checked(const uint8_t *data, size_t len,
     return ds;
 }
 
-/* Decode one record, check it, and account it like the real tool does. */
+/* Account a decoded frame like the real tool does. Independently of
+ * analyze.c, count the G-PDUs that belong in the tunnel table: those whose
+ * GTP-U headers were read in full, whatever their user packet looks like.
+ * At the end, the tunnel table must hold exactly that many packets. */
+static void account(struct analysis *an, struct totals *tot,
+                    struct packet_info *pi, uint32_t caplen, uint32_t wirelen,
+                    uint64_t ts_ns, unsigned long long iter)
+{
+    if (pi->is_gtpu && pi->gtp_msg_ok && pi->gtp_msg_type == GTPU_MSG_GPDU)
+        tot->tunnel_gpdus++;
+    if (analysis_account(an, pi, caplen, wirelen, ts_ns) != 0)
+        fail("flow table out of memory", iter);
+}
+
+/* Decode one record, check it, and account it. */
 static void process_record(const struct pcap_record *rec, struct analysis *an,
-                           unsigned long long iter)
+                           struct totals *tot, unsigned long long iter)
 {
     struct packet_info pi;
 
     if (rec->wirelen < rec->caplen)
         fail("record wire length below captured length", iter);
     decode_checked(rec->data, rec->caplen, rec->wirelen, &pi, iter);
-    if (analysis_account(an, &pi, rec->caplen, rec->wirelen, rec->ts_ns) != 0)
-        fail("flow table out of memory", iter);
+    account(an, tot, &pi, rec->caplen, rec->wirelen, rec->ts_ns, iter);
 }
 
 /* Build a small pcap file from mutated frames, corrupt it, and read it from
@@ -617,7 +657,7 @@ static void fuzz_reader(const struct bytebuf *seeds, size_t nseeds,
             if (mrec.caplen > PCAP_MAX_CAPLEN || mrec.caplen > file.len ||
                 (size_t)(mrec.data - exact) > file.len - mrec.caplen)
                 fail("record outside the input buffer", iter);
-            process_record(&mrec, an, iter);
+            process_record(&mrec, an, tot, iter);
             tot->file_records++;
         }
     }
@@ -672,6 +712,28 @@ static void fuzz_addr(struct totals *tot, unsigned long long iter)
         fail("IPv6 text form differs from inet_ntop", iter);
     }
     tot->addrs++;
+}
+
+/* The tunnel table must hold every G-PDU that account() expected, and the
+ * user-packet problem counters must be subsets of the totals (report.c
+ * subtracts them). */
+static void check_tunnel_totals(const struct analysis *an,
+                                const struct totals *tot)
+{
+    const struct gtpu_stats *g = &an->stats.gtpu;
+    unsigned long long packets = 0;
+    const struct flow *f;
+    size_t pos = 0;
+
+    while ((f = flow_table_next(&an->tunnels, &pos)) != NULL)
+        packets += f->packets;
+    if (packets != tot->tunnel_gpdus)
+        fail("tunnel table packets differ from G-PDUs with complete headers",
+             0);
+    if (g->user_truncated > g->truncated || g->user_malformed > g->malformed)
+        fail("user-packet problems exceed all GTP-U problems", 0);
+    printf("tunnels: %llu G-PDUs with complete GTP-U headers, all in the "
+           "tunnel table\n", packets);
 }
 
 /* Print the top (at most) 100 entries of a flow or tunnel table. */
@@ -796,9 +858,7 @@ int main(int argc, char **argv)
             tot.gtpu_by_status[pi.gtp_status]++;
             tot.gtpu_inner += pi.has_inner;
         }
-        if (analysis_account(&an, &pi, (uint32_t)len, (uint32_t)wirelen,
-                             i) != 0)
-            fail("flow table out of memory", i);
+        account(&an, &tot, &pi, (uint32_t)len, (uint32_t)wirelen, i, i);
 
         if ((i & 3) == 0)
             fuzz_reader(seeds, nseeds, &an, &tot, i);
@@ -834,6 +894,7 @@ int main(int argc, char **argv)
     printf("flow table: %zu flows, %llu later fragments matched; tunnel "
            "table: %zu tunnels\n", an.flows.count,
            (unsigned long long)an.stats.frag_matched, an.tunnels.count);
+    check_tunnel_totals(&an, &tot);
     fuzz_reports(&an);
     printf("result: no crashes, no sanitizer reports, all invariants held\n");
 

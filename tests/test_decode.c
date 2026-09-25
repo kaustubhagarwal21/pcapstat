@@ -774,6 +774,7 @@ static void test_status_strings(void)
     CHECK(!decode_status_is_truncation(DEC_BAD_VLAN_DEPTH));
     CHECK(!decode_status_is_truncation(DEC_BAD_UDP_LEN));
     CHECK(!decode_status_is_truncation(DEC_BAD_GTPU_INNER));
+    CHECK(!decode_status_is_truncation(DEC_BAD_GTPU_INNER_SHORT));
 }
 
 void run_decode_tests(void)

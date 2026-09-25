@@ -330,6 +330,12 @@ static enum decode_status decode_gtpu_inner(struct span *s,
     default:
         return DEC_BAD_GTPU_INNER;
     }
+    /* The IP decoders call a packet that is too short for their fixed
+     * header a short frame. Here the frame is fine: the GTP-U length left
+     * too little room for the user packet, so give it a reason that says
+     * so. No other check in those decoders returns DEC_BAD_SHORT_FRAME. */
+    if (st == DEC_BAD_SHORT_FRAME)
+        st = DEC_BAD_GTPU_INNER_SHORT;
 
     /* Keep whatever was valid, even if decoding failed further in: an
      * inner packet with a good IP header and a bad TCP header still has
@@ -432,6 +438,11 @@ static enum decode_status decode_gtpu(struct span *s, struct packet_info *pi)
         advance(s, elen);
         pi->gtp_ext_count = (uint8_t)hops;
     }
+
+    /* Every GTP-U header of the message has now been read and checked.
+     * Whatever happens in the user packet below, the message itself (and
+     * so the tunnel it belongs to) is known. */
+    pi->gtp_msg_ok = 1;
 
     /* Echo, error indication, end marker and the other signalling messages
      * carry information elements, not user data. They are counted by type;
@@ -537,6 +548,7 @@ const char *decode_status_str(enum decode_status s)
     case DEC_BAD_GTPU_EXT_LEN:     return "GTP-U extension header length 0";
     case DEC_BAD_GTPU_EXT:         return "GTP-U extension header invalid";
     case DEC_BAD_GTPU_INNER:       return "G-PDU payload not IPv4 or IPv6";
+    case DEC_BAD_GTPU_INNER_SHORT: return "G-PDU payload too short for IP header";
     case DEC_STATUS_COUNT:         break;
     }
     return "unknown";

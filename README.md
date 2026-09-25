@@ -53,7 +53,7 @@ sample and benchmark captures.
 
 ```sh
 make                  # release build: build/pcapstat
-make test             # 93 unit tests + 37 CLI checks
+make test             # 96 unit tests + 37 CLI checks
 make asan             # the same tests under ASan + UBSan
 make fuzz             # 200,000 fuzz iterations under ASan + UBSan
 make bench            # build a 1,000,000-packet capture, then time pcapstat on it
@@ -175,7 +175,11 @@ Ethernet | IP base station -> core | UDP 2152 | GTP-U TEID | IP phone -> server 
 - **Message types.** A G-PDU (255) carries a user packet. Echo Request (1),
   Echo Response (2), Error Indication (26) and End Marker (254) are counted
   by type, and any other type as "other". Their information elements are
-  not decoded.
+  not decoded. The type and the flags sit in the first 8 bytes, so the
+  counts by type and option include messages that later turn out to be
+  malformed (an echo request with S set but no room for the sequence
+  number counts as an echo request, as "sequence number in", and as a
+  problem).
 - **The user packet.** Its first 4 bits select IPv4 or IPv6, and it goes
   through the same `decode_ipv4()` / `decode_ipv6()` functions as the outer
   packet. It gets the same checks (IHL, total length, extension headers,
@@ -199,6 +203,15 @@ Ethernet | IP base station -> core | UDP 2152 | GTP-U TEID | IP phone -> server 
   same list of reasons, and counted in the GTP-U part of the summary. A
   G-PDU with a broken extension header still counts in its outer UDP flow,
   because the outer headers are fine.
+- **Two layers inside the tunnel.** Once the GTP-U headers (header,
+  optional fields, extension headers) have been read in full,
+  `pi->gtp_msg_ok` is set. Anything that goes wrong after that point is in
+  the user packet. The summary counts the two kinds of problem on separate
+  lines, because only the first kind keeps a G-PDU out of its tunnel (see
+  [Tunnels](#tunnels)). A user packet whose GTP-U length leaves less room
+  than an IP header has its own reason ("G-PDU payload too short for IP
+  header"), rather than the outer decoder's "frame too short for its
+  headers": the frame is fine.
 - **Zero-length extension headers.** A length of 0 would describe a header
   too short to hold even its own length byte, and accepting it would let
   the walk stand still. It has its own malformation reason. The chain is
@@ -215,8 +228,20 @@ Ethernet | IP base station -> core | UDP 2152 | GTP-U TEID | IP phone -> server 
 
 ### Tunnels
 
-A cleanly decoded G-PDU is also added to a second hash table, keyed by
-(outer source, outer destination, TEID). Unlike a flow key, a tunnel key is
+A G-PDU whose GTP-U headers decoded in full is also added to a second hash
+table, keyed by (outer source, outer destination, TEID), with its full
+length on the wire. The state of the user packet inside does not matter.
+The key does not depend on it, and the tunnel carried those bytes whether
+or not the capture kept them. GTP-U captures are often taken headers-only,
+with a small snapshot length that cuts most user packets short, and the
+tunnel table must not lose those G-PDUs. The same goes for a malformed user
+packet: its tunnel still carried it, just as the outer flow still counts a
+G-PDU whose GTP-U header is broken. A G-PDU whose GTP-U headers are broken
+or cut short is left out, because then the message itself could not be
+checked. The summary's two GTP-U "Problems" lines count these two cases
+separately.
+
+Unlike a flow key, a tunnel key is
 not put in canonical order. The TEID is chosen by the node that receives
 the packets, so the uplink and the downlink of one session use different
 TEIDs, and two nodes can pick the same value independently. Each direction
@@ -278,8 +303,9 @@ GTP-U:       249 packets on UDP port 2152
   Options:   sequence number in 35, extension headers in 199
   Inner IP:  IPv4 123, IPv6 107; TCP 112, UDP 108, ICMP 4, ICMPv6 6, other 0
   Tunnels:   20 (20 distinct TEIDs)
-  Skipped:   0 GTP' or other version, 0 GTP-U in GTP-U, 0 IP fragments on port 2152
-  Problems:  0 truncated, 0 malformed (excluded from tunnels)
+  Skipped:   0 GTP' or other version, 0 GTP-U in GTP-U, 0 fragmented datagrams on port 2152
+  Problems:  0 truncated, 0 malformed in GTP-U headers (not added to tunnels)
+             0 truncated, 0 malformed in user packets (still added to tunnels)
 
 Top 5 of 20 GTP-U tunnels by bytes (one direction each; the receiver chose the TEID):
   #  teid        src          dst           packets       bytes      duration
@@ -301,6 +327,12 @@ Notes on reading it:
   packets, and 112 TCP + 108 UDP + 4 ICMP + 6 ICMPv6 = 230.
 - The generator gives every session its own uplink and downlink TEID, so
   the 20 tunnels are the two directions of 10 sessions.
+- Cut the same capture to its first 96 bytes per packet (what
+  `editcap -s 96` does), and 113 of the 230 user packets end inside their
+  IPv4, IPv6 or TCP header. The second "Problems" line then reads "113
+  truncated, 0 malformed in user packets (still added to tunnels)". The
+  tunnel table and the tunnels CSV are byte for byte the same as for the
+  full capture: 20 tunnels, all 230 G-PDUs, and the same bytes in each.
 
 ## Design
 
@@ -440,7 +472,7 @@ say, for example, "TCP data offset invalid: 3".
 
 ## Testing
 
-`make test` runs 93 unit tests (43,739 individual checks) and 37 CLI checks.
+`make test` runs 96 unit tests (43,857 individual checks) and 37 CLI checks.
 The tests use a small assert framework in `tests/test.h` with no external
 dependencies. `tests/builder.c` builds frames and pcap files byte by byte, so
 each test states exactly what the decoder sees. The tests cover:
@@ -476,7 +508,7 @@ each test states exactly what the decoder sees. The tests cover:
   exact counters: a mixed capture, fragments joining their flow, complete
   short frames counted as malformed, and a broken IPv6 chain counted under
   no transport protocol.
-- **GTP-U** (`tests/test_gtpu.c`, 20 tests):
+- **GTP-U** (`tests/test_gtpu.c`, 23 tests):
   - G-PDUs with IPv4/TCP and with IPv6/UDP inside, and IPv6 transport on a
     VLAN.
   - The S, PN and E flags, including a non-zero next-type byte with E
@@ -492,8 +524,13 @@ each test states exactly what the decoder sees. The tests cover:
   - Versions 0, 2 and 7, and PT 0 (GTP'), counted as not GTPv1-U.
   - Echo request and response, error indication, end marker and an
     unknown type.
-  - A payload that is not IP, an empty G-PDU, and a user packet too short
-    for its own header.
+  - A payload that is not IP, an empty G-PDU, and IPv4 and IPv6 user
+    packets too short for their own header, which get the GTP-U reason and
+    not the outer "frame too short for its headers".
+  - `gtp_msg_ok` at each stage: set when the user packet is cut short at
+    three points or is malformed, and clear when the capture ends inside
+    the first 8 bytes, the GTP-U length is too large, or an extension
+    header is cut short or has length 0.
   - GTP-U inside GTP-U, flagged and not decoded.
   - Port 2152 as the source only and as the destination only; also a
     7-byte payload, TCP on port 2152 and a first IP fragment, none of
@@ -505,6 +542,12 @@ each test states exactly what the decoder sees. The tests cover:
   - A 15-frame capture that checks every GTP-U counter and the tunnel table
     (direction, a TEID reused by another node, top-N). It also checks that
     a G-PDU with a broken GTP-U header still counts in its outer flow.
+  - A 9-frame headers-only capture. G-PDUs whose user packet was cut by
+    the snapshot length (inside its TCP, IPv4 or IPv6 header, or right
+    after the GTP-U header) or is malformed still join their tunnels, with
+    their full wire length. A tunnel whose only packet was cut short is
+    still listed. A G-PDU cut inside an extension header does not join its
+    tunnel, and the two "Problems" lines count each case on its side.
   - The exact tunnels CSV text and the GTP-U summary text.
 - **CLI** (`tests/cli_test.sh`): exit codes for `--help`, usage errors, a
   missing file, a non-pcap file, a truncated capture (partial stats plus exit
@@ -554,7 +597,9 @@ same fuzz report, number for number. Each iteration does the following:
   captured length equals its wire length is never classified as truncated,
   and neither is the GTP-U message inside it. GTP-U fields are never set
   outside a clean, unfragmented UDP port 2152 datagram, and a clean G-PDU
-  always has an inner packet.
+  always has an inner packet. `gtp_msg_ok` is set exactly when the reason
+  for stopping, if any, is not a GTP-U header problem, and no user packet
+  is decoded without it.
 - It formats one random IPv6 address (half its groups zero, sometimes
   IPv4-mapped) and compares the text with the C library's `inet_ntop()`.
 
@@ -565,13 +610,15 @@ from memory, and through `fread()` from a `tmpfile()`. Both readers must
 return the same records and the same final status. At the end, the summary,
 the GTP-U section, both top-N tables and both CSVs are written for the whole
 fuzzed flow and tunnel tables, and each CSV must have exactly one row per
-entry.
+entry. The fuzzer also counts, on its own, the G-PDUs whose GTP-U headers
+decoded in full, and the tunnel table must hold exactly that many packets.
 
 `make fuzz` (200,000 iterations, seed 1) reached:
 
 - all 20 outcomes of the outer decoder;
-- inside GTP-U, all 7 GTP-U problem reasons, and 13 of the 14 that the
-  user packet can have (not "truncated IPv6 extension header");
+- inside GTP-U, all 8 GTP-U problem reasons (5 in the GTP-U headers, 3
+  about a G-PDU's payload), and 12 of the 13 that the user packet's IP and
+  transport headers can have (not "truncated IPv6 extension header");
 - 7 of the reader's format-error paths.
 
 pcapng detection is not reached by random mutation; a unit test covers it
@@ -588,7 +635,7 @@ decoder: 200000 mutated frames
 GTP-U: 33547 of those frames decoded as GTP-U, 14837 with a valid inner packet
   ok                                     20180
   truncated IPv4 header                  439
-  ...                                    (13 user-packet reasons reached)
+  ...                                    (12 user-packet reasons reached)
   truncated GTP-U header                 567
   truncated GTP-U extension header       146
   G-PDU truncated before its IP packet   28
@@ -597,13 +644,15 @@ GTP-U: 33547 of those frames decoded as GTP-U, 14837 with a valid inner packet
   GTP-U extension header length 0        325
   GTP-U extension header invalid         1051
   G-PDU payload not IPv4 or IPv6         1372
+  G-PDU payload too short for IP header  369
 reader: 50000 mutated pcap files (each read from memory and through stdio), 70604 records decoded
   end of file                            28691
   ...
   corrupt record: captured length exceeds 262144 bytes 5310
 addresses: 200000 IPv6 addresses checked against inet_ntop
-flow table: 29633 flows, 11533 later fragments matched; tunnel table: 3384 tunnels
-reports: summary, GTP-U section, top 100 flow and top 100 tunnel tables, 29633-row and 3384-row CSVs written
+flow table: 29633 flows, 11533 later fragments matched; tunnel table: 4168 tunnels
+tunnels: 31579 G-PDUs with complete GTP-U headers, all in the tunnel table
+reports: summary, GTP-U section, top 100 flow and top 100 tunnel tables, 29633-row and 4168-row CSVs written
 result: no crashes, no sanitizer reports, all invariants held
 ```
 
@@ -612,7 +661,7 @@ mutated frames (168,400 of them decoded as GTP-U), 250,000 mutated files
 (354,460 records) and 1,000,000 addresses, with a byte-identical report
 from gcc 13.3.0 and clang 17.0.6.
 
-Four checks that the fuzzer finds real bugs, each on a scratch copy:
+Five checks that the fuzzer finds real bugs, each on a scratch copy:
 
 - With the `hlen > cap` check in `decode_ipv4` deleted, `make fuzz` failed
   with an ASan `heap-buffer-overflow` report in `decode_l4`.
@@ -627,6 +676,11 @@ Four checks that the fuzzer finds real bugs, each on a scratch copy:
   truncated". No memory was read wrongly. The lying length only raised the
   `wire` bound and never `cap`, so the cap/wire invariant was the only
   thing that could notice.
+- With the tunnel rule changed back to an earlier version, which added a
+  G-PDU to its tunnel only if its user packet also decoded cleanly
+  (`gtp_status == DEC_OK` instead of `gtp_msg_ok` in `analysis_account`),
+  the run failed its end-of-run check: "tunnel table packets differ from
+  G-PDUs with complete headers". The headers-only unit test fails too.
 
 **Compilers.** Locally (WSL2, Ubuntu 24.04), `make`, `make test`,
 `make asan` and `make fuzz FUZZ_ITERS=1000000` all pass with gcc 13.3.0 and

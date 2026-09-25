@@ -561,9 +561,138 @@ static void test_gtpu_inner_not_ip(void)
     rest.len = 12;
     gtpu_uplink(&b, 0x30, GTPU_MSG_GPDU, 1, &rest);
     CHECK_EQ(decode_all(&b, &pi), DEC_OK);
-    CHECK_EQ(pi.gtp_status, DEC_BAD_SHORT_FRAME);
+    CHECK_EQ(pi.gtp_status, DEC_BAD_GTPU_INNER_SHORT);
     bb_free(&b);
     bb_free(&rest);
+}
+
+static void test_gtpu_inner_too_short(void)
+{
+    struct bytebuf in, rest, b;
+    struct packet_info pi;
+
+    /* A GTP-U length that covers only 10 bytes of an IPv4 packet. The frame
+     * is whole, so this must not be reported as the outer "frame too short
+     * for its headers": the reason names the G-PDU payload. */
+    bb_init(&in);
+    bb_init(&rest);
+    bb_init(&b);
+    inner_v4_tcp(&in, 0);
+    bb_bytes(&rest, in.data, 10);
+    gtpu_uplink(&b, 0x30, GTPU_MSG_GPDU, 1, &rest);
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_BAD_GTPU_INNER_SHORT);
+    CHECK(pi.gtp_msg_ok);
+    CHECK(!pi.has_inner);
+    CHECK(strcmp(decode_status_str(pi.gtp_status),
+                 "G-PDU payload too short for IP header") == 0);
+    bb_free(&b);
+    bb_free(&rest);
+    bb_free(&in);
+
+    /* The same for IPv6: 30 of its 40 header bytes. */
+    put_ipv6(&in, IPPROTO_NUM_UDP, TEST_V6_A, TEST_V6_B, 8);
+    put_udp(&in, 5353, 53, 0);
+    bb_bytes(&rest, in.data, 30);
+    gtpu_uplink(&b, 0x30, GTPU_MSG_GPDU, 1, &rest);
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_BAD_GTPU_INNER_SHORT);
+    bb_free(&b);
+
+    /* Consistent lengths, but the capture stops 30 bytes into the IPv6
+     * header: that is still truncation, not this malformation. */
+    bb_free(&rest);
+    bb_bytes(&rest, in.data, in.len);
+    gtpu_uplink(&b, 0x30, GTPU_MSG_GPDU, 1, &rest);
+    CHECK_EQ(decode_snap(&b, GTP_AT + 8 + 30, b.len, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_TRUNC_IPV6);
+    bb_free(&b);
+    bb_free(&rest);
+    bb_free(&in);
+
+    /* The outer decoder keeps its own reason for a whole frame that ends
+     * inside its IPv4 header. */
+    put_eth(&b, ETHERTYPE_IPV4);
+    bb_fill(&b, 0x45, 10);
+    CHECK_EQ(decode_all(&b, &pi), DEC_BAD_SHORT_FRAME);
+    bb_free(&b);
+}
+
+/* gtp_msg_ok says the GTP-U headers were read in full. It is what puts a
+ * G-PDU in its tunnel, so it must not depend on the user packet. */
+static void test_gtpu_msg_ok(void)
+{
+    struct bytebuf in, rest, b;
+    struct packet_info pi;
+
+    bb_init(&in);
+    bb_init(&rest);
+    bb_init(&b);
+    inner_v4_tcp(&in, 100);
+    gtpu_uplink(&b, 0x30, GTPU_MSG_GPDU, 0x100, &in);
+
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_OK);
+    CHECK(pi.gtp_msg_ok);
+
+    /* The user packet cut by the snapshot length, at three points. */
+    CHECK_EQ(decode_snap(&b, GTP_AT + 8 + 30, b.len, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_TRUNC_TCP);
+    CHECK(pi.gtp_msg_ok);
+    CHECK_EQ(pi.teid, 0x100);
+    CHECK_EQ(decode_snap(&b, GTP_AT + 8 + 10, b.len, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_TRUNC_IPV4);
+    CHECK(pi.gtp_msg_ok);
+    CHECK_EQ(decode_snap(&b, GTP_AT + 8, b.len, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_TRUNC_GTPU_INNER);
+    CHECK(pi.gtp_msg_ok);
+
+    /* Cut inside the 8-byte header: nothing is known. */
+    CHECK_EQ(decode_snap(&b, GTP_AT + 7, b.len, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_TRUNC_GTPU);
+    CHECK(!pi.gtp_v1u && !pi.gtp_msg_ok);
+
+    /* A malformed user packet (TCP data offset 3) leaves the message
+     * itself intact. */
+    b.data[GTP_AT + 8 + 20 + 12] = 0x30;
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_BAD_TCP_DOFF);
+    CHECK(pi.gtp_msg_ok);
+    b.data[GTP_AT + 8 + 20 + 12] = 0x50;
+
+    /* A GTP-U length that is too big: the message is broken. */
+    b.data[GTP_AT + 3]++;
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_BAD_GTPU_LEN);
+    CHECK(pi.gtp_v1u && !pi.gtp_msg_ok);
+    bb_free(&b);
+
+    /* An extension header cut by the snapshot length, and one of length 0:
+     * the headers were not read in full. */
+    put_gtpu_opt(&rest, 0, 0, 0x85);
+    put_gtpu_ext(&rest, 3, 0);
+    bb_bytes(&rest, in.data, in.len);
+    gtpu_uplink(&b, 0x34, GTPU_MSG_GPDU, 0x300, &rest);
+    CHECK_EQ(decode_snap(&b, GTP_AT + 8 + 4 + 6, b.len, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_TRUNC_GTPU_EXT);
+    CHECK(pi.gtp_v1u && !pi.gtp_msg_ok);
+    b.data[GTP_AT + 8 + 4] = 0;
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK_EQ(pi.gtp_status, DEC_BAD_GTPU_EXT_LEN);
+    CHECK(!pi.gtp_msg_ok);
+    bb_free(&b);
+    bb_free(&rest);
+
+    /* Signalling messages and headers that are not GTPv1-U. */
+    gtpu_uplink(&b, 0x30, GTPU_MSG_END_MARKER, 0x200, &rest);
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK(pi.gtp_msg_ok);
+    bb_free(&b);
+    gtpu_uplink(&b, 0x20, GTPU_MSG_GPDU, 0x200, &in);
+    CHECK_EQ(decode_all(&b, &pi), DEC_OK);
+    CHECK(pi.is_gtpu && !pi.gtp_v1u && !pi.gtp_msg_ok);
+    bb_free(&b);
+    bb_free(&in);
 }
 
 static void test_gtpu_in_gtpu_not_decoded(void)
@@ -1018,26 +1147,7 @@ static void test_tunnel_table(void)
     bb_free(&cap);
 }
 
-/* A cleanly decoded G-PDU stand-in with only the fields the tunnel table
- * reads. */
-static struct packet_info gpdu_pkt(const uint8_t *src, const uint8_t *dst,
-                                   uint32_t teid)
-{
-    struct packet_info pi;
-
-    memset(&pi, 0, sizeof pi);
-    pi.has_l2 = pi.has_l3 = pi.has_l4 = 1;
-    pi.ip_version = 4;
-    pi.ip_proto = IPPROTO_NUM_UDP;
-    memcpy(pi.src_addr, src, 4);
-    memcpy(pi.dst_addr, dst, 4);
-    pi.src_port = pi.dst_port = GTPU_PORT;
-    pi.is_gtpu = pi.gtp_v1u = 1;
-    pi.gtp_msg_type = GTPU_MSG_GPDU;
-    pi.teid = teid;
-    return pi;
-}
-
+/* Everything written to `f` so far, as a string the caller frees. */
 static char *slurp(FILE *f)
 {
     long size;
@@ -1057,6 +1167,204 @@ static char *slurp(FILE *f)
     }
     text[size] = '\0';
     return text;
+}
+
+/* Add a frame of which only the first `caplen` bytes were captured, as
+ * with a snapshot length. */
+static void add_record_snap(struct bytebuf *cap, struct bytebuf *fr,
+                            uint32_t sec, size_t caplen)
+{
+    pcap_put_record(cap, 0, sec, 0, fr->data, (uint32_t)caplen,
+                    (uint32_t)fr->len);
+    bb_free(fr);
+}
+
+/*
+ * A headers-only capture: a G-PDU belongs to its tunnel as soon as its
+ * GTP-U headers are read, whatever happened to the user packet.
+ *
+ *   1  TEID 0x100 RAN -> CORE, IPv4/TCP + 100 bytes, captured in full  190
+ *   2  the same, cut inside the user packet's TCP header               190
+ *   3  the same, cut inside its IPv4 header                            190
+ *   4  the same, cut right after the GTP-U header                      190
+ *   5  TEID 0x200 CORE -> RAN, IPv6/UDP, cut inside the IPv6 header    118
+ *   6  TEID 0x300, cut inside an extension header: not in a tunnel
+ *   7  TEID 0x100, TCP data offset 3 in the user packet (malformed)     90
+ *   8  TEID 0x400, GTP-U length covers 10 bytes of an IPv4 header       60
+ *   9  echo request, S set but GTP-U length 3 (malformed header)
+ */
+static void test_tunnel_snap_cut(void)
+{
+    struct bytebuf cap, fr, in, rest;
+    struct analysis an;
+    struct packet_info key_pkt;
+    struct flow_key key;
+    const struct flow *f;
+    const struct gtpu_stats *g = &an.stats.gtpu;
+    size_t teids;
+    FILE *out;
+    char *text;
+
+    bb_init(&cap);
+    bb_init(&fr);
+    bb_init(&in);
+    bb_init(&rest);
+    pcap_put_global(&cap, 0, 0, 65535, 1);
+
+    inner_v4_tcp(&in, 100);
+    gtpu_uplink(&fr, 0x30, GTPU_MSG_GPDU, 0x100, &in);            /* 1 */
+    add_record(&cap, &fr, 1);
+    gtpu_uplink(&fr, 0x30, GTPU_MSG_GPDU, 0x100, &in);            /* 2 */
+    add_record_snap(&cap, &fr, 2, GTP_AT + 8 + 30);
+    gtpu_uplink(&fr, 0x30, GTPU_MSG_GPDU, 0x100, &in);            /* 3 */
+    add_record_snap(&cap, &fr, 3, GTP_AT + 8 + 10);
+    gtpu_uplink(&fr, 0x30, GTPU_MSG_GPDU, 0x100, &in);            /* 4 */
+    add_record_snap(&cap, &fr, 4, GTP_AT + 8);
+    bb_free(&in);
+
+    put_ipv6(&in, IPPROTO_NUM_UDP, TEST_V6_A, TEST_V6_B, 8 + 20);  /* 5 */
+    put_udp(&in, 5353, 53, 20);
+    bb_fill(&in, 0, 20);
+    gtpu_frame4(&fr, CORE, RAN, GTPU_PORT, GTPU_PORT, 0x30, GTPU_MSG_GPDU,
+                0x200, &in);
+    CHECK_EQ(fr.len, 118);
+    add_record_snap(&cap, &fr, 5, GTP_AT + 8 + 20);
+    bb_free(&in);
+
+    inner_v4_tcp(&in, 0);
+    put_gtpu_opt(&rest, 0, 0, 0x85);                               /* 6 */
+    put_gtpu_ext(&rest, 3, 0);
+    bb_bytes(&rest, in.data, in.len);
+    gtpu_uplink(&fr, 0x34, GTPU_MSG_GPDU, 0x300, &rest);
+    add_record_snap(&cap, &fr, 6, GTP_AT + 8 + 4 + 6);
+    bb_free(&rest);
+
+    gtpu_uplink(&fr, 0x30, GTPU_MSG_GPDU, 0x100, &in);            /* 7 */
+    fr.data[GTP_AT + 8 + 20 + 12] = 0x30;
+    add_record(&cap, &fr, 7);
+
+    bb_bytes(&rest, in.data, 10);                                  /* 8 */
+    gtpu_uplink(&fr, 0x30, GTPU_MSG_GPDU, 0x400, &rest);
+    add_record(&cap, &fr, 8);
+    bb_free(&rest);
+    bb_free(&in);
+
+    bb_be16(&rest, 0x0102);                                        /* 9 */
+    bb_u8(&rest, 0);
+    gtpu_frame4(&fr, RAN, CORE, 50000, GTPU_PORT, 0x32,
+                GTPU_MSG_ECHO_REQUEST, 0, &rest);
+    add_record(&cap, &fr, 9);
+    bb_free(&rest);
+
+    analyze_capture(&cap, &an);
+
+    /* The outer packets are all fine, and all in their flows. */
+    CHECK_EQ(an.stats.packets, 9);
+    CHECK_EQ(an.stats.truncated, 0);
+    CHECK_EQ(an.stats.malformed, 0);
+    CHECK_EQ(an.flows.count, 2);       /* RAN<->CORE on 2152, and the echo */
+
+    /* Three tunnels; TEID 0x300 is not one of them. */
+    CHECK_EQ(an.tunnels.count, 3);
+    CHECK_EQ(flow_table_distinct_teids(&an.tunnels, &teids), 0);
+    CHECK_EQ(teids, 3);
+
+    memset(&key_pkt, 0, sizeof key_pkt);
+    key_pkt.is_gtpu = key_pkt.gtp_v1u = 1;
+    key_pkt.ip_version = 4;
+    key_pkt.ip_proto = IPPROTO_NUM_UDP;
+    memcpy(key_pkt.src_addr, RAN, 4);
+    memcpy(key_pkt.dst_addr, CORE, 4);
+    key_pkt.teid = 0x100;
+    CHECK(tunnel_key_from_packet(&key_pkt, &key));
+    f = flow_table_find(&an.tunnels, &key);
+    /* Frames 1-4 and 7, each with its full length on the wire. */
+    CHECK(f != NULL);
+    if (f != NULL) {
+        CHECK_EQ(f->packets, 5);
+        CHECK_EQ(f->bytes, 4 * 190 + 90);
+    }
+    key_pkt.teid = 0x400;
+    CHECK(tunnel_key_from_packet(&key_pkt, &key));
+    f = flow_table_find(&an.tunnels, &key);
+    CHECK(f != NULL && f->packets == 1 && f->bytes == 60);
+    key_pkt.teid = 0x300;
+    CHECK(tunnel_key_from_packet(&key_pkt, &key));
+    CHECK(flow_table_find(&an.tunnels, &key) == NULL);
+    /* The tunnel whose only packet lost its user header to the snapshot
+     * length is there, with the packet's wire length. */
+    key_pkt.teid = 0x200;
+    memcpy(key_pkt.src_addr, CORE, 4);
+    memcpy(key_pkt.dst_addr, RAN, 4);
+    CHECK(tunnel_key_from_packet(&key_pkt, &key));
+    f = flow_table_find(&an.tunnels, &key);
+    CHECK(f != NULL && f->packets == 1 && f->bytes == 118);
+
+    CHECK_EQ(g->packets, 9);
+    CHECK_EQ(g->gpdu, 8);
+    /* Counted by type and option from its header, although the rest of
+     * the header turned out to be malformed. */
+    CHECK_EQ(g->echo_request, 1);
+    CHECK_EQ(g->with_seq, 1);
+    CHECK_EQ(g->truncated, 5);         /* frames 2-6 */
+    CHECK_EQ(g->user_truncated, 4);    /* frames 2-5 */
+    CHECK_EQ(g->malformed, 3);         /* frames 7-9 */
+    CHECK_EQ(g->user_malformed, 2);    /* frames 7 and 8 */
+    CHECK_EQ(g->by_status[DEC_TRUNC_TCP], 1);
+    CHECK_EQ(g->by_status[DEC_TRUNC_IPV4], 1);
+    CHECK_EQ(g->by_status[DEC_TRUNC_GTPU_INNER], 1);
+    CHECK_EQ(g->by_status[DEC_TRUNC_IPV6], 1);
+    CHECK_EQ(g->by_status[DEC_TRUNC_GTPU_EXT], 1);
+    CHECK_EQ(g->by_status[DEC_BAD_TCP_DOFF], 1);
+    CHECK_EQ(g->by_status[DEC_BAD_GTPU_INNER_SHORT], 1);
+    CHECK_EQ(g->by_status[DEC_BAD_GTPU_LEN], 1);
+    /* Frames 1, 2 and 7 got as far as a valid user IPv4 header. */
+    CHECK_EQ(g->inner_ipv4, 3);
+    CHECK_EQ(g->inner_ipv6, 0);
+    CHECK_EQ(g->inner_tcp, 3);
+
+    out = tmpfile();
+    CHECK(out != NULL);
+    if (out != NULL) {
+        CHECK_EQ(report_gtpu(out, &an.stats, &an.tunnels), 0);
+        text = slurp(out);
+        CHECK(text != NULL);
+        if (text != NULL) {
+            CHECK(strstr(text, "  Tunnels:   3 (3 distinct TEIDs)\n") != NULL);
+            CHECK(strstr(text, "  Problems:  1 truncated, 1 malformed in "
+                               "GTP-U headers (not added to tunnels)\n"
+                               "             4 truncated, 2 malformed in "
+                               "user packets (still added to tunnels)\n")
+                  != NULL);
+            CHECK(strstr(text, "    G-PDU payload too short for IP header")
+                  != NULL);
+            CHECK(strstr(text, "frame too short") == NULL);
+        }
+        free(text);
+        fclose(out);
+    }
+    analysis_free(&an);
+    bb_free(&cap);
+}
+
+/* A cleanly decoded G-PDU stand-in with only the fields the tunnel table
+ * reads. */
+static struct packet_info gpdu_pkt(const uint8_t *src, const uint8_t *dst,
+                                   uint32_t teid)
+{
+    struct packet_info pi;
+
+    memset(&pi, 0, sizeof pi);
+    pi.has_l2 = pi.has_l3 = pi.has_l4 = 1;
+    pi.ip_version = 4;
+    pi.ip_proto = IPPROTO_NUM_UDP;
+    memcpy(pi.src_addr, src, 4);
+    memcpy(pi.dst_addr, dst, 4);
+    pi.src_port = pi.dst_port = GTPU_PORT;
+    pi.is_gtpu = pi.gtp_v1u = 1;
+    pi.gtp_msg_type = GTPU_MSG_GPDU;
+    pi.teid = teid;
+    return pi;
 }
 
 static void test_tunnels_csv(void)
@@ -1131,9 +1439,12 @@ static void test_gtpu_report_text(void)
                            "ICMP 0, ICMPv6 0, other 0\n") != NULL);
         CHECK(strstr(text, "  Tunnels:   6 (4 distinct TEIDs)\n") != NULL);
         CHECK(strstr(text, "  Skipped:   1 GTP' or other version, 1 GTP-U "
-                           "in GTP-U, 1 IP fragments on port 2152\n")
+                           "in GTP-U, 1 fragmented datagrams on port 2152\n")
               != NULL);
-        CHECK(strstr(text, "  Problems:  0 truncated, 1 malformed") != NULL);
+        CHECK(strstr(text, "  Problems:  0 truncated, 1 malformed in GTP-U "
+                           "headers (not added to tunnels)\n"
+                           "             0 truncated, 0 malformed in user "
+                           "packets (still added to tunnels)\n") != NULL);
         CHECK(strstr(text, "    GTP-U extension header length 0") != NULL);
         CHECK(strstr(text, "Top 2 of 6 GTP-U tunnels by bytes") != NULL);
         CHECK(strstr(text, "  1  0x00000200  172.16.0.1   172.16.1.11") !=
@@ -1171,12 +1482,15 @@ void run_gtpu_tests(void)
     RUN_TEST(test_gtpu_echo);
     RUN_TEST(test_gtpu_signalling_messages);
     RUN_TEST(test_gtpu_inner_not_ip);
+    RUN_TEST(test_gtpu_inner_too_short);
+    RUN_TEST(test_gtpu_msg_ok);
     RUN_TEST(test_gtpu_in_gtpu_not_decoded);
     RUN_TEST(test_gtpu_port_detection);
     RUN_TEST(test_gtpu_outer_ipv6_vlan);
     RUN_TEST(test_gtpu_every_prefix);
     RUN_TEST(test_gtpu_stats);
     RUN_TEST(test_tunnel_table);
+    RUN_TEST(test_tunnel_snap_cut);
     RUN_TEST(test_tunnels_csv);
     RUN_TEST(test_gtpu_report_text);
 }

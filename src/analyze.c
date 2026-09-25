@@ -42,11 +42,15 @@ int analysis_account(struct analysis *a, struct packet_info *pi,
     if (flow_table_add_packet(&a->flows, pi, wirelen, ts_ns) != 0)
         return -1;
 
-    /* The same rule one level down: a G-PDU joins its tunnel only if the
-     * GTP-U header and the user packet inside decoded cleanly. The outer
-     * flow above counts it either way, since the outer headers are fine.
-     * Echo and the other signalling messages are counted, not tunnelled. */
-    if (pi->is_gtpu && pi->gtp_v1u && pi->gtp_status == DEC_OK &&
+    /* The same rule one level down: a G-PDU joins its tunnel if its own
+     * layer, the GTP-U headers, was read in full (gtp_msg_ok). The tunnel
+     * key (outer source, outer destination, TEID) does not depend on the
+     * user packet, so a user packet cut by the snapshot length, which is
+     * normal in a headers-only capture, or even a malformed one, does not
+     * keep the G-PDU out: the tunnel carried those bytes. Likewise the outer
+     * flow above counts a G-PDU whose GTP-U header is broken. Echo and the
+     * other signalling messages are counted, not tunnelled. */
+    if (pi->is_gtpu && pi->gtp_v1u && pi->gtp_msg_ok &&
         pi->gtp_msg_type == GTPU_MSG_GPDU &&
         flow_table_add_tunnel(&a->tunnels, pi, wirelen, ts_ns) != 0)
         return -1;

@@ -23,7 +23,8 @@ int analysis_init(struct analysis *a);
 /*
  * Account one decoded packet: attribute it if it is a later fragment,
  * update the global counters and, if it decoded cleanly, its flow and, for
- * a cleanly decoded G-PDU, its GTP-U tunnel. `pi` may be modified (a later
+ * a G-PDU whose GTP-U headers decoded cleanly, its GTP-U tunnel (whatever
+ * state the user packet inside is in). `pi` may be modified (a later
  * fragment can receive its datagram's ports). Returns 0, or -1 if a table
  * could not grow.
  */

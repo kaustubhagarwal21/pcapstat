@@ -12,11 +12,15 @@
  * `fragmented`, which counts datagrams that were never decoded. */
 struct gtpu_stats {
     uint64_t packets;          /* decoded as GTP-U (packet_info.is_gtpu) */
-    uint64_t fragmented;       /* first IP fragments on port 2152: no
-                                  reassembly, so not decoded */
+    uint64_t fragmented;       /* datagrams on port 2152 split into IP
+                                  fragments, counted by their first
+                                  fragment: no reassembly, so not decoded */
     uint64_t not_v1u;          /* GTP' or another version: not decoded */
 
-    uint64_t gpdu;             /* GTPv1-U messages by type */
+    /* By type and by option, for every GTPv1-U header that was read: the
+     * type and the flags are in its first 8 bytes. That includes messages
+     * later found malformed, which are also counted as problems below. */
+    uint64_t gpdu;
     uint64_t echo_request;
     uint64_t echo_response;
     uint64_t error_indication;
@@ -24,7 +28,7 @@ struct gtpu_stats {
     uint64_t other_type;
 
     uint64_t with_seq;         /* S flag set */
-    uint64_t with_ext;         /* at least one extension header */
+    uint64_t with_ext;         /* at least one extension header walked */
 
     uint64_t inner_ipv4;       /* G-PDUs whose user packet has a valid IP
                                   header */
@@ -38,6 +42,9 @@ struct gtpu_stats {
 
     uint64_t truncated;        /* GTP-U messages that could not be fully */
     uint64_t malformed;        /* decoded, and why (packet_info.gtp_status) */
+    uint64_t user_truncated;   /* ... of those, G-PDUs whose GTP-U headers */
+    uint64_t user_malformed;   /* were fine but whose user packet was not;
+                                  they still join their tunnel */
     uint64_t by_status[DEC_STATUS_COUNT];
 };
 
